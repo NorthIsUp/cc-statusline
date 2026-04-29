@@ -57,6 +57,12 @@ right = [
   "effort",
   "spinner",
 ]
+# Tip: address individual quota buckets at separate layout positions with
+# the dotted form, e.g.
+#   right = ["burn", "quotas.hourly", "ctx_bar", "quotas.weekly", "model"]
+# Recognised dotted entries: quotas.hourly, quotas.weekly, quotas.design,
+# quotas.sonnet. The bare `quotas` entry still renders every configured
+# bucket joined with `·`.
 gap = 2
 autoresize = true
 hysteresis_band = 2
@@ -120,6 +126,7 @@ default  = "m"
 
 # [quotas.hourly]    # 5-hour bucket (rate_limits.five_hour)
 # mode = "vbar"
+# priority = 30      # elevate just this bucket when used as `quotas.hourly`
 
 # [quotas.weekly]    # 7-day bucket (rate_limits.seven_day)
 # mode = "hbar"

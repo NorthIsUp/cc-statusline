@@ -261,6 +261,72 @@
     }
   },
   "definitions": {
+    "BucketConfig": {
+      "description": "Per-bucket override block. Carries both the percent-display fields (`mode`/`width`/`filled`/`empty`) and the layout `ComponentConfig` knobs (`priority`/`min`/`required`/...) — the latter let users elevate a single bucket's autoresize priority via e.g. `[quotas.hourly] priority = 30`.",
+      "type": "object",
+      "properties": {
+        "default": {
+          "description": "Override of the default size. None = component's `default_size()`.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Size"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "empty": {
+          "description": "Override for the empty-cell glyph in `hbar` mode. Defaults to a single space so the bar reads cleanly as \"filled to here, empty after\".",
+          "default": " ",
+          "type": "string"
+        },
+        "filled": {
+          "description": "Override for the full-cell glyph in `hbar` mode. Defaults to `█`.",
+          "default": "█",
+          "type": "string"
+        },
+        "min": {
+          "description": "Don't shrink past this size. None = component's smallest.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Size"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mode": {
+          "$ref": "#/definitions/PctMode"
+        },
+        "priority": {
+          "description": "Higher = shrunk LAST when autoresizing. Default 5.",
+          "default": 5,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "required": {
+          "description": "If true, never drop entirely.",
+          "default": false,
+          "type": "boolean"
+        },
+        "sizes": {
+          "description": "Sizes the user has whitelisted. Empty = use the component's full set.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Size"
+          }
+        },
+        "width": {
+          "default": 10,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
     "BurnConfig": {
       "description": "Per-component config for `burn`. Inherits the shared `[pct]` knobs (`mode`, `width`, `filled`, `empty`) plus the burn-specific `max_tokens_per_hour` ceiling used to derive a percent. Default mode is `percent`, which preserves the legacy `Σ <human>/hr` text rendering. The visual modes (`dots`, `shaded`, `hbar`, `vbar`) replace the text with a bar; `float` also keeps the legacy text format.",
       "type": "object",
@@ -573,30 +639,6 @@
         }
       }
     },
-    "PctConfig": {
-      "type": "object",
-      "properties": {
-        "empty": {
-          "description": "Override for the empty-cell glyph in `hbar` mode. Defaults to a single space so the bar reads cleanly as \"filled to here, empty after\".",
-          "default": " ",
-          "type": "string"
-        },
-        "filled": {
-          "description": "Override for the full-cell glyph in `hbar` mode. Defaults to `█`.",
-          "default": "█",
-          "type": "string"
-        },
-        "mode": {
-          "$ref": "#/definitions/PctMode"
-        },
-        "width": {
-          "default": 10,
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        }
-      }
-    },
     "PctMode": {
       "type": "string",
       "enum": [
@@ -627,7 +669,7 @@
           "description": "Override for the design-partner bucket.",
           "anyOf": [
             {
-              "$ref": "#/definitions/PctConfig"
+              "$ref": "#/definitions/BucketConfig"
             },
             {
               "type": "null"
@@ -648,7 +690,7 @@
           "description": "Override for the 5-hour bucket (`rate_limits.five_hour`).",
           "anyOf": [
             {
-              "$ref": "#/definitions/PctConfig"
+              "$ref": "#/definitions/BucketConfig"
             },
             {
               "type": "null"
@@ -692,7 +734,7 @@
           "description": "Override for the sonnet model bucket.",
           "anyOf": [
             {
-              "$ref": "#/definitions/PctConfig"
+              "$ref": "#/definitions/BucketConfig"
             },
             {
               "type": "null"
@@ -703,7 +745,7 @@
           "description": "Override for the 7-day bucket (`rate_limits.seven_day`).",
           "anyOf": [
             {
-              "$ref": "#/definitions/PctConfig"
+              "$ref": "#/definitions/BucketConfig"
             },
             {
               "type": "null"

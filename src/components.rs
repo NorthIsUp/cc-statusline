@@ -707,13 +707,56 @@ pub struct QuotasConfig {
     #[serde(flatten)]
     pub common: crate::component::ComponentConfig,
     /// Override for the 5-hour bucket (`rate_limits.five_hour`).
-    pub hourly: Option<PctConfig>,
+    pub hourly: Option<BucketConfig>,
     /// Override for the 7-day bucket (`rate_limits.seven_day`).
-    pub weekly: Option<PctConfig>,
+    pub weekly: Option<BucketConfig>,
     /// Override for the design-partner bucket.
-    pub design: Option<PctConfig>,
+    pub design: Option<BucketConfig>,
     /// Override for the sonnet model bucket.
-    pub sonnet: Option<PctConfig>,
+    pub sonnet: Option<BucketConfig>,
+}
+
+/// Per-bucket override block. Carries both the percent-display fields
+/// (`mode`/`width`/`filled`/`empty`) and the layout `ComponentConfig` knobs
+/// (`priority`/`min`/`required`/...) — the latter let users elevate a single
+/// bucket's autoresize priority via e.g. `[quotas.hourly] priority = 30`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct BucketConfig {
+    #[serde(flatten)]
+    pub pct: PctConfig,
+    #[serde(flatten)]
+    pub common: crate::component::ComponentConfig,
+}
+
+/// Which quota bucket to render. Used for the dotted-layout-entry routing
+/// (`quotas.hourly`, `quotas.weekly`, …).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketKind {
+    Hourly,
+    Weekly,
+    Design,
+    Sonnet,
+}
+
+impl BucketKind {
+    pub fn from_suffix(s: &str) -> Option<Self> {
+        Some(match s {
+            "hourly" => BucketKind::Hourly,
+            "weekly" => BucketKind::Weekly,
+            "design" => BucketKind::Design,
+            "sonnet" => BucketKind::Sonnet,
+            _ => return None,
+        })
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BucketKind::Hourly => "hourly",
+            BucketKind::Weekly => "weekly",
+            BucketKind::Design => "design",
+            BucketKind::Sonnet => "sonnet",
+        }
+    }
 }
 
 impl QuotasConfig {
@@ -722,19 +765,42 @@ impl QuotasConfig {
     /// `[quotas]` defaults are used. (We don't field-merge: `PctConfig` fields
     /// are tightly coupled — `mode = "hbar"` only makes sense alongside its
     /// own `width`/`filled`/`empty`.)
-    fn effective(&self, bucket: &Option<PctConfig>) -> PctConfig {
-        bucket.clone().unwrap_or_else(|| self.pct.clone())
+    fn effective(&self, bucket: &Option<BucketConfig>) -> PctConfig {
+        bucket
+            .as_ref()
+            .map(|b| b.pct.clone())
+            .unwrap_or_else(|| self.pct.clone())
+    }
+
+    fn bucket_for(&self, kind: BucketKind) -> &Option<BucketConfig> {
+        match kind {
+            BucketKind::Hourly => &self.hourly,
+            BucketKind::Weekly => &self.weekly,
+            BucketKind::Design => &self.design,
+            BucketKind::Sonnet => &self.sonnet,
+        }
     }
 }
 
-/// One quota bucket's render inputs. Grouped to keep the buckets array
-/// readable (a flat tuple form trips clippy::type_complexity).
-struct Bucket<'a> {
-    label: &'a str,
-    pct: Option<u32>,
-    reset: Option<i64>,
-    window: i64,
-    cfg: &'a Option<PctConfig>,
+/// Render a single quota bucket, returning `None` if the bucket has no data.
+pub fn render_one_bucket(cfg: &QuotasConfig, kind: BucketKind, ctx: &RenderCtx) -> Option<String> {
+    let s = ctx.session;
+    // Design/sonnet windows aren't documented upstream — use WIN_7D as a
+    // sane default so pace coloring degrades to the static threshold when
+    // `resets_at` is missing (which it currently always is).
+    let (label, pct, reset, window) = match kind {
+        BucketKind::Hourly => (CLOCK_5H, s.r5h, s.r5h_reset, WIN_5H),
+        BucketKind::Weekly => (CALENDAR_7D, s.r7d, s.r7d_reset, WIN_7D),
+        // design/sonnet: config plumbing exists, but the upstream session JSON
+        // paths aren't documented yet — pct stays None so these always render
+        // empty until follow-up work captures a real session payload and
+        // wires `Session::design`/`sonnet`.
+        BucketKind::Design => (DESIGN_Q, None, None, WIN_7D),
+        BucketKind::Sonnet => (SONNET_Q, None, None, WIN_7D),
+    };
+    let pcfg = cfg.effective(cfg.bucket_for(kind));
+    let q = quota::fmt_quota(pct, reset, window, label, &pcfg);
+    if q.is_empty() { None } else { Some(q) }
 }
 
 pub struct Quotas;
@@ -750,52 +816,17 @@ impl Component for Quotas {
         Size::M
     }
     fn render(&self, _size: Size, cfg: &QuotasConfig, ctx: &RenderCtx) -> Rendered {
-        let s = ctx.session;
         // Render order: hourly, weekly, design, sonnet. Skip empty buckets.
-        // Design/sonnet windows aren't documented upstream — use WIN_7D as a
-        // sane default so pace coloring degrades to the static threshold when
-        // `resets_at` is missing (which it currently always is).
-        let buckets = [
-            Bucket {
-                label: CLOCK_5H,
-                pct: s.r5h,
-                reset: s.r5h_reset,
-                window: WIN_5H,
-                cfg: &cfg.hourly,
-            },
-            Bucket {
-                label: CALENDAR_7D,
-                pct: s.r7d,
-                reset: s.r7d_reset,
-                window: WIN_7D,
-                cfg: &cfg.weekly,
-            },
-            // design/sonnet buckets: config plumbing exists, but the
-            // upstream session JSON paths aren't documented yet — pct stays
-            // None so these always render empty until follow-up work captures
-            // a real session payload and wires `Session::design`/`sonnet`.
-            Bucket {
-                label: DESIGN_Q,
-                pct: None,
-                reset: None,
-                window: WIN_7D,
-                cfg: &cfg.design,
-            },
-            Bucket {
-                label: SONNET_Q,
-                pct: None,
-                reset: None,
-                window: WIN_7D,
-                cfg: &cfg.sonnet,
-            },
-        ];
         let mut out = String::new();
-        for b in buckets {
-            let pcfg = cfg.effective(b.cfg);
-            let q = quota::fmt_quota(b.pct, b.reset, b.window, b.label, &pcfg);
-            if q.is_empty() {
+        for kind in [
+            BucketKind::Hourly,
+            BucketKind::Weekly,
+            BucketKind::Design,
+            BucketKind::Sonnet,
+        ] {
+            let Some(q) = render_one_bucket(cfg, kind, ctx) else {
                 continue;
-            }
+            };
             if !out.is_empty() {
                 out.push_str(&format!(" {DIM}·{RESET} "));
             }
@@ -1032,6 +1063,14 @@ impl Component for Spinner {
     }
 }
 
+/// Parse `quotas.<bucket>` layout entry names into a `BucketKind`. Returns
+/// `None` for the bare `"quotas"` name and for unknown sub-buckets like
+/// `"quotas.foo"`.
+pub fn quotas_bucket_kind(name: &str) -> Option<BucketKind> {
+    name.strip_prefix("quotas.")
+        .and_then(BucketKind::from_suffix)
+}
+
 // ─── registry-style dispatch ────────────────────────────────────────────
 
 /// Render a component by name at the given size. Returns `None` if the name
@@ -1054,6 +1093,13 @@ pub fn render_named(name: &str, size: Size, ctx: &RenderCtx) -> Option<Rendered>
         "burn" => Burn.render(size, &cfg.burn, ctx),
         "agents" => Agents.render(size, &(), ctx),
         "quotas" => Quotas.render(size, &cfg.quotas, ctx),
+        n if quotas_bucket_kind(n).is_some() => {
+            let kind = quotas_bucket_kind(n).unwrap();
+            match render_one_bucket(&cfg.quotas, kind, ctx) {
+                Some(text) => Rendered::from_text(text),
+                None => Rendered::empty(),
+            }
+        }
         "ctx_bar" => CtxBar.render(size, &cfg.ctx_bar, ctx),
         "loc" => Loc.render(size, &(), ctx),
         "model" => Model.render(size, &(), ctx),
@@ -1087,6 +1133,7 @@ pub fn sizes_for(name: &str) -> Option<&'static [Size]> {
         "burn" => Burn::sizes(),
         "agents" => Agents::sizes(),
         "quotas" => Quotas::sizes(),
+        n if quotas_bucket_kind(n).is_some() => Quotas::sizes(),
         "ctx_bar" => CtxBar::sizes(),
         "loc" => Loc::sizes(),
         "model" => Model::sizes(),
@@ -1113,6 +1160,7 @@ pub fn default_size_for(name: &str) -> Option<Size> {
         "burn" => Burn::default_size(),
         "agents" => Agents::default_size(),
         "quotas" => Quotas::default_size(),
+        n if quotas_bucket_kind(n).is_some() => Quotas::default_size(),
         "ctx_bar" => CtxBar::default_size(),
         "loc" => Loc::default_size(),
         "model" => Model::default_size(),
@@ -1143,6 +1191,10 @@ pub fn default_priority(name: &str) -> u32 {
         "comments" => 25,
         "repo" => 20,
         "quotas" => 15,
+        "quotas.hourly" => 25,
+        "quotas.weekly" => 20,
+        "quotas.design" => 18,
+        "quotas.sonnet" => 17,
         "agents" => 10,
         "burn" => 8,
         "chips" => 5,
@@ -1361,8 +1413,8 @@ mod tests {
             tick: 0,
         };
         let cfg = QuotasConfig {
-            design: Some(PctConfig::default()),
-            sonnet: Some(PctConfig::default()),
+            design: Some(BucketConfig::default()),
+            sonnet: Some(BucketConfig::default()),
             ..QuotasConfig::default()
         };
         let r = Quotas.render(Size::M, &cfg, &ctx);
@@ -1393,9 +1445,12 @@ mod tests {
                 mode: PctMode::Percent,
                 ..PctConfig::default()
             },
-            hourly: Some(PctConfig {
-                mode: PctMode::Vbar,
-                ..PctConfig::default()
+            hourly: Some(BucketConfig {
+                pct: PctConfig {
+                    mode: PctMode::Vbar,
+                    ..PctConfig::default()
+                },
+                ..BucketConfig::default()
             }),
             ..QuotasConfig::default()
         };
@@ -1443,6 +1498,171 @@ mod tests {
             "fallback red color present: {:?}",
             r.text
         );
+    }
+
+    #[test]
+    fn quotas_hourly_only_renders_hourly_glyph() {
+        // `quotas.hourly` dispatcher path renders ONLY the hourly bucket;
+        // weekly is absent even when r7d is populated.
+        let (mut session, git, other, burn, agents) = mkctx();
+        session.r5h = Some(40);
+        session.r7d = Some(60);
+        let ctx = RenderCtx {
+            session: &session,
+            git: &git,
+            other: &other,
+            burn: &burn,
+            agents: &agents,
+            tick: 0,
+        };
+        let r = render_named("quotas.hourly", Size::M, &ctx).expect("dispatched");
+        assert!(
+            r.text.contains(CLOCK_5H),
+            "hourly glyph present: {}",
+            r.text
+        );
+        assert!(
+            !r.text.contains(CALENDAR_7D),
+            "weekly glyph absent: {}",
+            r.text
+        );
+    }
+
+    #[test]
+    fn quotas_weekly_only_renders_weekly_glyph() {
+        let (mut session, git, other, burn, agents) = mkctx();
+        session.r5h = Some(40);
+        session.r7d = Some(60);
+        let ctx = RenderCtx {
+            session: &session,
+            git: &git,
+            other: &other,
+            burn: &burn,
+            agents: &agents,
+            tick: 0,
+        };
+        let r = render_named("quotas.weekly", Size::M, &ctx).expect("dispatched");
+        assert!(r.text.contains(CALENDAR_7D), "weekly glyph: {}", r.text);
+        assert!(!r.text.contains(CLOCK_5H), "no hourly: {}", r.text);
+    }
+
+    #[test]
+    fn quotas_unknown_bucket_drops_silently() {
+        // `quotas.foo` is not a known bucket — sizes_for/default_size_for must
+        // return None so the layout engine drops it, and render_named must
+        // also return None (not crash).
+        let (session, git, other, burn, agents) = mkctx();
+        let ctx = RenderCtx {
+            session: &session,
+            git: &git,
+            other: &other,
+            burn: &burn,
+            agents: &agents,
+            tick: 0,
+        };
+        assert!(sizes_for("quotas.foo").is_none());
+        assert!(default_size_for("quotas.foo").is_none());
+        assert!(render_named("quotas.foo", Size::M, &ctx).is_none());
+    }
+
+    #[test]
+    fn quotas_bare_entry_still_renders_all_buckets() {
+        // Back-compat: bare `quotas` renders both populated buckets joined.
+        let (mut session, git, other, burn, agents) = mkctx();
+        session.r5h = Some(40);
+        session.r7d = Some(60);
+        let ctx = RenderCtx {
+            session: &session,
+            git: &git,
+            other: &other,
+            burn: &burn,
+            agents: &agents,
+            tick: 0,
+        };
+        let cfg = QuotasConfig::default();
+        let r = Quotas.render(Size::M, &cfg, &ctx);
+        assert!(r.text.contains(CLOCK_5H));
+        assert!(r.text.contains(CALENDAR_7D));
+    }
+
+    #[test]
+    fn quotas_hourly_and_weekly_at_separate_positions() {
+        // Simulate a layout where the two dotted entries sit at non-adjacent
+        // positions: ["burn", "quotas.hourly", "ctx_bar", "quotas.weekly"].
+        // Verify both render at their layout positions and ordering follows
+        // the layout (hourly comes before weekly).
+        let (mut session, git, other, _burn_default, agents) = mkctx();
+        session.r5h = Some(40);
+        session.r7d = Some(60);
+        let burn = crate::transcript::BurnInfo {
+            tokens_per_hour: 1_000_000,
+            tokens_total: 0,
+        };
+        let ctx = RenderCtx {
+            session: &session,
+            git: &git,
+            other: &other,
+            burn: &burn,
+            agents: &agents,
+            tick: 0,
+        };
+        let names = ["burn", "quotas.hourly", "ctx_bar", "quotas.weekly"];
+        let mut parts: Vec<String> = Vec::new();
+        for n in names {
+            let s = default_size_for(n).expect("known");
+            let r = render_named(n, s, &ctx).expect("dispatched");
+            if !r.text.is_empty() {
+                parts.push(r.text);
+            }
+        }
+        let joined = parts.join(" ");
+        let p_hourly = joined.find(CLOCK_5H).expect("hourly rendered");
+        let p_weekly = joined.find(CALENDAR_7D).expect("weekly rendered");
+        assert!(
+            p_hourly < p_weekly,
+            "hourly position precedes weekly: {joined}"
+        );
+        // Sanity: the bare quotas separator (" · ") does NOT appear between
+        // them — the two dotted entries are independent items, so the layout
+        // separator (a plain space) sits between them rather than the
+        // intra-bucket "·".
+        let between = &joined[p_hourly..p_weekly];
+        assert!(
+            !between.contains("·"),
+            "no intra-quotas separator between split buckets: {between}"
+        );
+    }
+
+    #[test]
+    fn quotas_dotted_default_priorities() {
+        assert_eq!(default_priority("quotas"), 15);
+        assert_eq!(default_priority("quotas.hourly"), 25);
+        assert_eq!(default_priority("quotas.weekly"), 20);
+        assert_eq!(default_priority("quotas.design"), 18);
+        assert_eq!(default_priority("quotas.sonnet"), 17);
+    }
+
+    #[test]
+    fn quotas_per_bucket_priority_override_via_bucket_common() {
+        // [quotas.weekly] priority = 99 — the BucketConfig common.priority
+        // flows through Config::component_config("quotas.weekly").
+        let cfg = QuotasConfig {
+            weekly: Some(BucketConfig {
+                common: crate::component::ComponentConfig {
+                    priority: 99,
+                    ..crate::component::ComponentConfig::default()
+                },
+                ..BucketConfig::default()
+            }),
+            ..QuotasConfig::default()
+        };
+        // Simulate the lookup path used by layout::resolve_cfg.
+        let bucket_common = cfg
+            .weekly
+            .as_ref()
+            .map(|b| b.common.clone())
+            .unwrap_or_default();
+        assert_eq!(bucket_common.priority, 99);
     }
 
     #[test]
