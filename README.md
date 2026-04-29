@@ -61,10 +61,9 @@ colors across every session.
 2. Bump `version` in `Cargo.toml`.
 3. Commit and push to `main`.
 
-The `tag.yml` workflow detects the version change, drops a `vX.Y.Z` tag, and
-the `release.yml` workflow builds binaries for 5 targets, uploads them with
-SHA256 checksums, and publishes a GitHub release with the matching CHANGELOG
-section as the body.
+The `release.yml` workflow watches Cargo.toml on main, reads the new version,
+builds binaries for 5 targets, drops a `vX.Y.Z` tag, and publishes a GitHub
+release with the matching CHANGELOG section as the body and SHA256 checksums.
 
 ## License
 
