@@ -15,6 +15,9 @@ pub struct LayoutConfig {
     pub gap: u32,
     pub autoresize: bool,
     pub hysteresis_band: u32,
+    /// When `chips` collapses to its compact `×N` form, render the expanded
+    /// `#a #b #c …` chain on a second row instead of dropping it.
+    pub overflow_chips_to_second_row: bool,
 }
 
 impl Default for LayoutConfig {
@@ -25,6 +28,7 @@ impl Default for LayoutConfig {
             gap: 2,
             autoresize: true,
             hysteresis_band: 2,
+            overflow_chips_to_second_row: true,
         }
     }
 }
