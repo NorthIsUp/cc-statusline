@@ -7,6 +7,7 @@
 use crate::component::{Component, RenderCtx, Rendered, Size};
 use crate::git::CiState;
 use crate::glyphs::*;
+use crate::pct::{self, PctConfig, PctMode};
 use crate::quota::{self, WIN_5H, WIN_7D};
 use serde::Deserialize;
 
@@ -584,9 +585,38 @@ fn human_burn(n: u64) -> String {
     }
 }
 
+/// Per-component config for `burn`. Inherits the shared `[pct]` knobs (`mode`,
+/// `width`, `filled`, `empty`) plus the burn-specific `max_tokens_per_hour`
+/// ceiling used to derive a percent. Default mode is `percent`, which
+/// preserves the legacy `Σ <human>/hr` text rendering. The visual modes
+/// (`dots`, `shaded`, `hbar`, `vbar`) replace the text with a bar; `float`
+/// also keeps the legacy text format.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct BurnConfig {
+    /// Tokens-per-hour value treated as 100%. Picked to map typical burn
+    /// rates (1M–3M/hr) to the 20–60% range so the visual modes are
+    /// meaningful without saturating to red.
+    pub max_tokens_per_hour: u64,
+    #[serde(flatten)]
+    pub pct: PctConfig,
+    #[serde(flatten)]
+    pub common: crate::component::ComponentConfig,
+}
+
+impl Default for BurnConfig {
+    fn default() -> Self {
+        Self {
+            max_tokens_per_hour: 5_000_000,
+            pct: PctConfig::default(),
+            common: crate::component::ComponentConfig::default(),
+        }
+    }
+}
+
 pub struct Burn;
 impl Component for Burn {
-    type Config = ();
+    type Config = BurnConfig;
     fn name() -> &'static str {
         "burn"
     }
@@ -596,14 +626,32 @@ impl Component for Burn {
     fn default_size() -> Size {
         Size::Xl
     }
-    fn render(&self, size: Size, _cfg: &(), ctx: &RenderCtx) -> Rendered {
+    fn render(&self, size: Size, cfg: &BurnConfig, ctx: &RenderCtx) -> Rendered {
         if ctx.burn.tokens_per_hour == 0 || size == Size::Xs {
             return Rendered::empty();
         }
-        let h = human_burn(ctx.burn.tokens_per_hour);
-        match size {
-            Size::Xl => Rendered::from_text(format!("{DIM}Σ{RESET} {h}{DIM}/hr{RESET}")),
-            _ => Rendered::from_text(format!("{DIM}Σ{RESET} {h}")),
+        // For text-y modes, keep the legacy `Σ <human>/hr` look.
+        match cfg.pct.mode {
+            PctMode::Percent | PctMode::Float => {
+                let h = human_burn(ctx.burn.tokens_per_hour);
+                let text = match size {
+                    Size::Xl => format!("{DIM}Σ{RESET} {h}{DIM}/hr{RESET}"),
+                    _ => format!("{DIM}Σ{RESET} {h}"),
+                };
+                Rendered::from_text(text)
+            }
+            _ => {
+                // Visual modes: render the percent bar derived from the
+                // configurable ceiling.
+                let max = cfg.max_tokens_per_hour.max(1);
+                let pct = ((ctx.burn.tokens_per_hour as u128 * 100) / max as u128).min(100) as u32;
+                let body = pct::render(pct, &cfg.pct);
+                let text = match size {
+                    Size::Xl => format!("{DIM}Σ{RESET} {body}{DIM}/hr{RESET}"),
+                    _ => format!("{DIM}Σ{RESET} {body}"),
+                };
+                Rendered::from_text(text)
+            }
         }
     }
 }
@@ -641,9 +689,23 @@ impl Component for Agents {
 
 // ─── quotas ─────────────────────────────────────────────────────────────
 
+/// Per-component config for `quotas`. Inherits the shared `[pct]` knobs
+/// (`mode`, `width`, `filled`, `empty`). Default mode is `percent` to
+/// preserve the legacy `<glyph> 47%` text. The reset-time suffix is appended
+/// by `quota::fmt_quota` regardless of mode, so users can switch the percent
+/// visual to `dots`/`hbar` without losing the reset clock.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct QuotasConfig {
+    #[serde(flatten)]
+    pub pct: PctConfig,
+    #[serde(flatten)]
+    pub common: crate::component::ComponentConfig,
+}
+
 pub struct Quotas;
 impl Component for Quotas {
-    type Config = ();
+    type Config = QuotasConfig;
     fn name() -> &'static str {
         "quotas"
     }
@@ -653,10 +715,10 @@ impl Component for Quotas {
     fn default_size() -> Size {
         Size::M
     }
-    fn render(&self, _size: Size, _cfg: &(), ctx: &RenderCtx) -> Rendered {
+    fn render(&self, _size: Size, cfg: &QuotasConfig, ctx: &RenderCtx) -> Rendered {
         let s = ctx.session;
-        let q5 = quota::fmt_quota(s.r5h, s.r5h_reset, WIN_5H, CLOCK_5H);
-        let q7 = quota::fmt_quota(s.r7d, s.r7d_reset, WIN_7D, CALENDAR_7D);
+        let q5 = quota::fmt_quota(s.r5h, s.r5h_reset, WIN_5H, CLOCK_5H, &cfg.pct);
+        let q7 = quota::fmt_quota(s.r7d, s.r7d_reset, WIN_7D, CALENDAR_7D, &cfg.pct);
         let mut out = String::new();
         if !q5.is_empty() {
             out.push_str(&q5);
@@ -676,60 +738,24 @@ impl Component for Quotas {
 
 // ─── ctx_bar ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+/// Per-component config for `ctx_bar`. Inherits the shared `[pct]` knobs
+/// (`mode`, `width`, `filled`, `empty`) via `serde(flatten)` — meaning the
+/// existing `[ctx_bar]` blocks with `width = 10`, `filled = "▓"`, `empty =
+/// "░"` continue to parse unchanged. They're treated as overrides for the
+/// `hbar` mode glyphs.
+///
+/// Default mode is `percent` (a plain `47%`); set `mode = "hbar"` to bring
+/// back the bar look (now with sub-cell precision via the eighths glyphs).
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct CtxBarConfig {
-    pub width: u32,
-    pub filled: String,
-    pub empty: String,
-    /// Common ComponentConfig fields lifted into the same TOML block. Lets
-    /// users write:
-    ///   [ctx_bar]
-    ///   priority = 9
-    ///   width = 10
-    ///   filled = "▓"
+    #[serde(flatten)]
+    pub pct: PctConfig,
     #[serde(flatten)]
     pub common: crate::component::ComponentConfig,
 }
-impl Default for CtxBarConfig {
-    fn default() -> Self {
-        Self {
-            width: 10,
-            filled: "▓".into(),
-            empty: "░".into(),
-            common: crate::component::ComponentConfig::default(),
-        }
-    }
-}
 
 pub struct CtxBar;
-
-fn bar_color(pct: u32) -> &'static str {
-    if pct >= 80 {
-        FG_RED
-    } else if pct >= 50 {
-        FG_YELLOW
-    } else {
-        DIM
-    }
-}
-
-fn build_bar(pct: u32, bw: u32, filled: &str, empty: &str) -> String {
-    let mut f = pct * bw / 100;
-    if f > bw {
-        f = bw;
-    }
-    let e = bw - f;
-    let mut s = String::new();
-    for _ in 0..f {
-        s.push_str(filled);
-    }
-    for _ in 0..e {
-        s.push_str(empty);
-    }
-    let c = bar_color(pct);
-    format!("{c}{s}{RESET}")
-}
 
 impl Component for CtxBar {
     type Config = CtxBarConfig;
@@ -744,28 +770,48 @@ impl Component for CtxBar {
     }
     fn render(&self, size: Size, cfg: &CtxBarConfig, ctx: &RenderCtx) -> Rendered {
         let pct = ctx.session.ctx_pct;
+        // Per-size visual:
+        //   Xs   one-cell `dots` glyph, regardless of configured mode (a
+        //        single percent doesn't read at one cell anyway).
+        //   S    just the percent text via the configured mode.
+        //   M    mode-rendered visual, plus a trailing `47%` text for legibility.
+        //   L    M + leading CTX glyph.
+        //   Xl   L + trailing `/ 200k tokens` annotation.
         match size {
             Size::Xs => {
-                // One cell, no number. Use the filled glyph if any progress,
-                // otherwise the empty glyph.
-                let g = if pct > 0 { &cfg.filled } else { &cfg.empty };
-                let c = bar_color(pct);
-                Rendered::from_text(format!("{c}{g}{RESET}"))
+                let dots_cfg = PctConfig {
+                    mode: PctMode::Dots,
+                    ..cfg.pct.clone()
+                };
+                Rendered::from_text(pct::render(pct, &dots_cfg))
             }
-            Size::S => Rendered::from_text(format!("{}%", pct)),
+            Size::S => Rendered::from_text(pct::render(pct, &cfg.pct)),
             Size::M => {
-                let bar = build_bar(pct, cfg.width, &cfg.filled, &cfg.empty);
-                Rendered::from_text(format!("{bar} {pct}%"))
+                let body = pct::render(pct, &cfg.pct);
+                // For the textual modes don't double-print the percent.
+                if matches!(cfg.pct.mode, PctMode::Percent | PctMode::Float) {
+                    Rendered::from_text(body)
+                } else {
+                    Rendered::from_text(format!("{body} {pct}%"))
+                }
             }
             Size::L => {
-                let bar = build_bar(pct, cfg.width, &cfg.filled, &cfg.empty);
-                Rendered::from_text(format!("{DIM}{CTX}{RESET} {bar} {pct}%"))
+                let body = pct::render(pct, &cfg.pct);
+                if matches!(cfg.pct.mode, PctMode::Percent | PctMode::Float) {
+                    Rendered::from_text(format!("{DIM}{CTX}{RESET} {body}"))
+                } else {
+                    Rendered::from_text(format!("{DIM}{CTX}{RESET} {body} {pct}%"))
+                }
             }
             Size::Xl => {
-                let bar = build_bar(pct, cfg.width, &cfg.filled, &cfg.empty);
-                Rendered::from_text(format!(
-                    "{DIM}Σ{RESET} {bar} {pct}% {DIM}/ 200k tokens{RESET}"
-                ))
+                let body = pct::render(pct, &cfg.pct);
+                if matches!(cfg.pct.mode, PctMode::Percent | PctMode::Float) {
+                    Rendered::from_text(format!("{DIM}Σ{RESET} {body} {DIM}/ 200k tokens{RESET}"))
+                } else {
+                    Rendered::from_text(format!(
+                        "{DIM}Σ{RESET} {body} {pct}% {DIM}/ 200k tokens{RESET}"
+                    ))
+                }
             }
         }
     }
@@ -933,9 +979,9 @@ pub fn render_named(name: &str, size: Size, ctx: &RenderCtx) -> Option<Rendered>
         "behind" => Behind.render(size, &(), ctx),
         "ticket" => Ticket.render(size, &(), ctx),
         "chips" => Chips.render(size, &cfg.chips, ctx),
-        "burn" => Burn.render(size, &(), ctx),
+        "burn" => Burn.render(size, &cfg.burn, ctx),
         "agents" => Agents.render(size, &(), ctx),
-        "quotas" => Quotas.render(size, &(), ctx),
+        "quotas" => Quotas.render(size, &cfg.quotas, ctx),
         "ctx_bar" => CtxBar.render(size, &cfg.ctx_bar, ctx),
         "loc" => Loc.render(size, &(), ctx),
         "model" => Model.render(size, &(), ctx),
@@ -1100,6 +1146,207 @@ mod tests {
         let xs = bar.render(Size::Xs, &cfg, &ctx).width;
         let xl = bar.render(Size::Xl, &cfg, &ctx).width;
         assert!(xl > xs);
+    }
+
+    #[test]
+    fn ctx_bar_hbar_mode_renders_bar_glyphs() {
+        let (mut session, git, other, burn, agents) = mkctx();
+        session.ctx_pct = 50;
+        let ctx = RenderCtx {
+            session: &session,
+            git: &git,
+            other: &other,
+            burn: &burn,
+            agents: &agents,
+            tick: 0,
+        };
+        let cfg = CtxBarConfig {
+            pct: PctConfig {
+                mode: PctMode::Hbar,
+                width: 10,
+                filled: "█".into(),
+                empty: " ".into(),
+            },
+            ..CtxBarConfig::default()
+        };
+        let r = CtxBar.render(Size::M, &cfg, &ctx);
+        assert!(
+            r.text.contains("█"),
+            "hbar should render block glyph: {}",
+            r.text
+        );
+        assert!(
+            r.text.contains("50%"),
+            "M size should still show percent suffix"
+        );
+    }
+
+    #[test]
+    fn ctx_bar_dots_mode_one_cell() {
+        let (mut session, git, other, burn, agents) = mkctx();
+        session.ctx_pct = 50;
+        let ctx = RenderCtx {
+            session: &session,
+            git: &git,
+            other: &other,
+            burn: &burn,
+            agents: &agents,
+            tick: 0,
+        };
+        let cfg = CtxBarConfig {
+            pct: PctConfig {
+                mode: PctMode::Dots,
+                ..PctConfig::default()
+            },
+            ..CtxBarConfig::default()
+        };
+        let r = CtxBar.render(Size::S, &cfg, &ctx);
+        assert!(r.text.contains("⡇"), "dots@50%% → ⡇: {}", r.text);
+    }
+
+    #[test]
+    fn quotas_dots_mode_renders_braille_glyph() {
+        let (mut session, git, other, burn, agents) = mkctx();
+        session.r5h = Some(50);
+        session.r5h_reset = None;
+        let ctx = RenderCtx {
+            session: &session,
+            git: &git,
+            other: &other,
+            burn: &burn,
+            agents: &agents,
+            tick: 0,
+        };
+        let cfg = QuotasConfig {
+            pct: PctConfig {
+                mode: PctMode::Dots,
+                ..PctConfig::default()
+            },
+            ..QuotasConfig::default()
+        };
+        let r = Quotas.render(Size::M, &cfg, &ctx);
+        assert!(
+            r.text.contains("⡇"),
+            "quotas dots@50%% should contain ⡇: {}",
+            r.text
+        );
+    }
+
+    #[test]
+    fn quotas_hbar_mode_renders_bar() {
+        let (mut session, git, other, burn, agents) = mkctx();
+        session.r7d = Some(80);
+        session.r7d_reset = None;
+        let ctx = RenderCtx {
+            session: &session,
+            git: &git,
+            other: &other,
+            burn: &burn,
+            agents: &agents,
+            tick: 0,
+        };
+        let cfg = QuotasConfig {
+            pct: PctConfig {
+                mode: PctMode::Hbar,
+                width: 5,
+                filled: "█".into(),
+                empty: " ".into(),
+            },
+            ..QuotasConfig::default()
+        };
+        let r = Quotas.render(Size::M, &cfg, &ctx);
+        assert!(
+            r.text.contains("█"),
+            "quotas hbar should contain █: {}",
+            r.text
+        );
+    }
+
+    #[test]
+    fn burn_dots_mode_renders_braille_glyph() {
+        let (session, git, other, _burn_default, agents) = mkctx();
+        let burn = crate::transcript::BurnInfo {
+            tokens_per_hour: 2_500_000, // 50% of default 5M ceiling
+            tokens_total: 0,
+        };
+        let ctx = RenderCtx {
+            session: &session,
+            git: &git,
+            other: &other,
+            burn: &burn,
+            agents: &agents,
+            tick: 0,
+        };
+        let cfg = BurnConfig {
+            pct: PctConfig {
+                mode: PctMode::Dots,
+                ..PctConfig::default()
+            },
+            ..BurnConfig::default()
+        };
+        let r = Burn.render(Size::Xl, &cfg, &ctx);
+        assert!(
+            r.text.contains("⡇"),
+            "burn dots@50%% should contain ⡇: {}",
+            r.text
+        );
+    }
+
+    #[test]
+    fn burn_hbar_mode_renders_bar() {
+        let (session, git, other, _burn_default, agents) = mkctx();
+        let burn = crate::transcript::BurnInfo {
+            tokens_per_hour: 5_000_000, // 100% at default ceiling
+            tokens_total: 0,
+        };
+        let ctx = RenderCtx {
+            session: &session,
+            git: &git,
+            other: &other,
+            burn: &burn,
+            agents: &agents,
+            tick: 0,
+        };
+        let cfg = BurnConfig {
+            pct: PctConfig {
+                mode: PctMode::Hbar,
+                width: 4,
+                filled: "█".into(),
+                empty: " ".into(),
+            },
+            ..BurnConfig::default()
+        };
+        let r = Burn.render(Size::Xl, &cfg, &ctx);
+        assert!(
+            r.text.contains("████"),
+            "burn hbar@100%% should fill: {}",
+            r.text
+        );
+    }
+
+    #[test]
+    fn burn_percent_mode_keeps_legacy_text() {
+        let (session, git, other, _b, agents) = mkctx();
+        let burn = crate::transcript::BurnInfo {
+            tokens_per_hour: 1_500_000,
+            tokens_total: 0,
+        };
+        let ctx = RenderCtx {
+            session: &session,
+            git: &git,
+            other: &other,
+            burn: &burn,
+            agents: &agents,
+            tick: 0,
+        };
+        let cfg = BurnConfig::default(); // mode = percent
+        let r = Burn.render(Size::Xl, &cfg, &ctx);
+        assert!(
+            r.text.contains("1.5M"),
+            "percent mode keeps human-burn text: {}",
+            r.text
+        );
+        assert!(r.text.contains("/hr"));
     }
 
     fn url(n: u32) -> String {

@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-04-29
+
+### Added
+
+- Unified percentage display modes (`PctMode`) shared by every percent-aware
+  component. New `mode` key on `[ctx_bar]`, `[quotas]`, and `[burn]`:
+  - `percent` (default) — `47%`
+  - `float`             — `0.47`
+  - `dots`              — single cell, 9 steps via braille `⠀⡀⡄⡆⡇⣇⣧⣷⣿`
+  - `shaded`            — single cell, 5 steps ` ░▒▓█`
+  - `hbar`              — multi-cell horizontal bar with sub-cell precision
+                          via `▏▎▍▌▋▊▉█` (replaces the old fixed-glyph blocks
+                          look — set `mode = "hbar"` to bring back the bar)
+  - `vbar`              — single cell, 8 vertical levels `▁▂▃▄▅▆▇█`
+  Color thresholds (red ≥80%, yellow ≥50%, dim otherwise) are unified in the
+  shared `pct::bar_color` so every component uses the same breakpoints.
+  (#10, closes #10)
+- `[burn].max_tokens_per_hour` (default `5_000_000`) — the ceiling against
+  which `tokens_per_hour` is mapped to a percent for the visual modes. The
+  text modes (`percent`, `float`) keep the legacy `Σ <human>/hr` rendering.
+- `[quotas]` is now a real config block (was unit). Quotas always renders
+  `<glyph> <pct-via-mode> (<reset>)` — the reset-time suffix lives outside
+  the mode-rendered glyph so users can switch the percent visual to
+  `dots`/`hbar` without losing the reset clock.
+
+### Changed
+
+- `[ctx_bar]` no longer has dedicated `width`/`filled`/`empty` keys at the
+  top level; they're now part of the shared `[pct]` knobs (and still parse
+  identically — old configs work unchanged, treated as overrides for `hbar`
+  mode glyphs). The default mode is `percent`, so existing renders that
+  relied on `[ctx_bar]` defaults will now show `47%` instead of the bar.
+  Set `mode = "hbar"` to restore the bar look.
+
 ## [0.1.5] - 2026-04-29
 
 ### Added

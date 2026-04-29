@@ -36,6 +36,7 @@ mod git;
 mod glyphs;
 mod input;
 mod layout;
+mod pct;
 mod quota;
 mod recent_prs;
 mod refresh;
