@@ -62,6 +62,10 @@ fn main() {
                 refresh::run_refresh_other(&args[2]);
                 return;
             }
+            "--refresh-stack" => {
+                refresh::run_refresh_stack(&args[2]);
+                return;
+            }
             _ => {}
         }
     }
@@ -91,6 +95,7 @@ fn render_once() {
     // tick the freshest data is in place.
     refresh::maybe_spawn_pr(&session.session_id, &session.cwd, &handle.state);
     refresh::maybe_spawn_other(&session.session_id, &session.transcript, &handle.state);
+    refresh::maybe_spawn_stack(&session.session_id, &session.cwd, &handle.state);
     recent_prs::maybe_spawn_refresh();
 
     handle.state.tick = handle.state.tick.wrapping_add(1);

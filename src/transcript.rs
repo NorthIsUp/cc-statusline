@@ -32,6 +32,18 @@ fn origin_to_repo(origin_url: &str) -> String {
 pub struct OtherPrs {
     pub urls: Vec<String>,
     pub states: HashMap<String, PrStateLite>,
+    /// Whether the current worktree is a Graphite stack (gt log --json
+    /// succeeded). When true, `stack_entries` is non-empty and trunk-first.
+    pub is_gt: bool,
+    /// Trunk-first branches with optional PR numbers and depth-from-trunk.
+    pub stack_entries: Vec<StackChipEntry>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct StackChipEntry {
+    pub branch: String,
+    pub pr: Option<u32>,
+    pub depth: u32,
 }
 
 #[derive(Debug, Default)]
@@ -65,6 +77,17 @@ pub fn other_prs_view(st: &State, origin_url: &str) -> OtherPrs {
             );
         }
     }
+    out.is_gt = st.stack.is_gt;
+    out.stack_entries = st
+        .stack
+        .entries
+        .iter()
+        .map(|e| StackChipEntry {
+            branch: e.branch.clone(),
+            pr: e.pr,
+            depth: e.depth,
+        })
+        .collect();
     out
 }
 

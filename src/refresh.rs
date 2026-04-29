@@ -13,6 +13,7 @@ use std::process::{Command, Stdio};
 
 const ENV_CWD: &str = "CC_STATUSLINE_REFRESH_CWD";
 const ENV_TRANSCRIPT: &str = "CC_STATUSLINE_REFRESH_TRANSCRIPT";
+const ENV_STACK_CWD: &str = "CC_STATUSLINE_STACK_CWD";
 
 pub fn maybe_spawn_pr(session_id: &str, cwd: &str, st: &state::State) {
     let ttl = config::config().pr_cache_ttl();
@@ -44,6 +45,24 @@ pub fn maybe_spawn_other(session_id: &str, transcript: &str, st: &state::State) 
         &["--refresh-other", session_id],
         &[(ENV_TRANSCRIPT, transcript)],
     );
+}
+
+/// Spawn an async refresh of the Graphite stack snapshot for `cwd`. Uses the
+/// same detached-respawn pattern as PR/other refreshes; the stack TTL is
+/// configurable (`[chips].stack_refresh_ttl`, default 60s). Also debounced by
+/// a `locked_at` field to prevent thundering-herd `gt` invocations.
+pub fn maybe_spawn_stack(session_id: &str, cwd: &str, st: &state::State) {
+    if cwd.is_empty() {
+        return;
+    }
+    let ttl = config::config().stack_refresh_ttl();
+    if state::fresh(st.stack.fetched_at, ttl) {
+        return;
+    }
+    if state::fresh(st.stack.locked_at, ttl.max(30)) {
+        return;
+    }
+    spawn_self(&["--refresh-stack", session_id], &[(ENV_STACK_CWD, cwd)]);
 }
 
 fn spawn_self(args: &[&str], envs: &[(&str, &str)]) {
@@ -160,6 +179,123 @@ pub fn run_refresh_other(session_id: &str) {
     // sessions. We just record the URL list and exit.
     handle.state.other_prs.locked_at = 0;
     let _ = handle.save();
+}
+
+/// Async Graphite stack refresh. Runs `gt log --json` in $CWD; on success,
+/// flattens the JSON into a trunk-first list of `StackEntry`. On any failure
+/// (gt missing, non-zero exit, malformed JSON), `is_gt` stays `false` so the
+/// chips component falls back to its legacy ascending-PR-number rendering —
+/// no error surface to the user.
+pub fn run_refresh_stack(session_id: &str) {
+    let cwd = std::env::var(ENV_STACK_CWD).unwrap_or_default();
+    if cwd.is_empty() {
+        return;
+    }
+    let mut handle = match StateLock::acquire_blocking(session_id) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let ttl = config::config().stack_refresh_ttl();
+    if state::fresh(handle.state.stack.fetched_at, ttl) {
+        return;
+    }
+    handle.state.stack.locked_at = now_epoch();
+    let _ = handle.save();
+
+    let (is_gt, entries) = fetch_stack(&cwd);
+    handle.state.stack.is_gt = is_gt;
+    handle.state.stack.entries = entries;
+    handle.state.stack.fetched_at = now_epoch();
+    handle.state.stack.locked_at = 0;
+    let _ = handle.save();
+}
+
+fn fetch_stack(cwd: &str) -> (bool, Vec<state::StackEntry>) {
+    let out = match Command::new("gt")
+        .args(["log", "--json"])
+        .current_dir(cwd)
+        .stderr(Stdio::null())
+        .output()
+    {
+        Ok(o) if o.status.success() && !o.stdout.is_empty() => o.stdout,
+        _ => return (false, Vec::new()),
+    };
+    let v: serde_json::Value = match serde_json::from_slice(&out) {
+        Ok(v) => v,
+        Err(_) => return (false, Vec::new()),
+    };
+    // `gt log --json` emits a flat array of entries. Each entry has at least
+    // `branch`, `parentBranch` (null for trunk), and optionally `prNumber`.
+    // We tolerate a top-level object containing the array under e.g.
+    // "branches" or "log" — best-effort to insulate against minor schema
+    // shifts in newer gt versions.
+    let arr = if let Some(a) = v.as_array() {
+        a.clone()
+    } else if let Some(a) = v.get("branches").and_then(|x| x.as_array()) {
+        a.clone()
+    } else if let Some(a) = v.get("log").and_then(|x| x.as_array()) {
+        a.clone()
+    } else {
+        return (false, Vec::new());
+    };
+    if arr.is_empty() {
+        return (false, Vec::new());
+    }
+    // Build branch→parent map and a branch→pr map.
+    use std::collections::HashMap;
+    let mut parent: HashMap<String, Option<String>> = HashMap::new();
+    let mut pr_of: HashMap<String, Option<u32>> = HashMap::new();
+    for e in &arr {
+        let branch = e
+            .get("branch")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        if branch.is_empty() {
+            continue;
+        }
+        let parent_branch = e
+            .get("parentBranch")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string());
+        let pr = e.get("prNumber").and_then(|x| x.as_u64()).map(|n| n as u32);
+        parent.insert(branch.clone(), parent_branch);
+        pr_of.insert(branch, pr);
+    }
+    // Compute depth for each branch by walking up to a root (parent==None or
+    // missing). Cap walk length to avoid pathological cycles.
+    let mut entries: Vec<state::StackEntry> = parent
+        .keys()
+        .map(|b| state::StackEntry {
+            branch: b.clone(),
+            pr: pr_of.get(b).copied().flatten(),
+            depth: depth_of(b, &parent),
+        })
+        .collect();
+    entries.sort_by_key(|e| (e.depth, e.branch.clone()));
+    (true, entries)
+}
+
+fn depth_of(start: &str, parent: &std::collections::HashMap<String, Option<String>>) -> u32 {
+    let mut d: u32 = 0;
+    let mut cur = start.to_string();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    loop {
+        if !seen.insert(cur.clone()) {
+            break; // cycle guard
+        }
+        match parent.get(&cur) {
+            Some(Some(p)) if !p.is_empty() => {
+                d += 1;
+                cur = p.clone();
+            }
+            _ => break,
+        }
+        if d > 64 {
+            break;
+        }
+    }
+    d
 }
 
 /// Fetch states for many PRs in one GraphQL call instead of N `gh pr view`s.

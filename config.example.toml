@@ -80,6 +80,18 @@ empty    = "░"
 
 [chips]
 priority = 5
+# Graphite stack rendering. When `gt log --json` succeeds in $CWD and at least
+# two of the session's discovered PRs map to branches in the stack, chips are
+# reordered trunk → leaf and joined with `stack_separator`, prefixed by
+# `stack_glyph` rendered in dim cyan. PRs not reachable from trunk are
+# appended after the stacked chain, sorted by ascending PR number.
+#
+# stack_glyph = ""        # disable the leading marker
+# force_stack = true      # use stack layout even when `gt` is absent
+stack_separator   = "─•─"
+stack_glyph       = ""   # nf-oct-git_branch
+force_stack       = false
+stack_refresh_ttl = 60
 
 [model]
 priority = 80
