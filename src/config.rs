@@ -187,6 +187,22 @@ impl Config {
             "burn" => self.burn.common.clone(),
             "agents" => pick(&self.agents),
             "quotas" => self.quotas.common.clone(),
+            n if crate::components::quotas_bucket_kind(n).is_some() => {
+                // Per-bucket layout knobs (priority/min/required/etc.) come
+                // from the `[quotas.<bucket>] common = ...` flattened fields
+                // when set; otherwise inherit the parent `[quotas]` common.
+                let bucket = crate::components::quotas_bucket_kind(n).unwrap();
+                let q = &self.quotas;
+                let bcfg = match bucket {
+                    crate::components::BucketKind::Hourly => &q.hourly,
+                    crate::components::BucketKind::Weekly => &q.weekly,
+                    crate::components::BucketKind::Design => &q.design,
+                    crate::components::BucketKind::Sonnet => &q.sonnet,
+                };
+                bcfg.as_ref()
+                    .map(|b| b.common.clone())
+                    .unwrap_or_else(|| q.common.clone())
+            }
             "ctx_bar" => self.ctx_bar.common.clone(),
             "loc" => pick(&self.loc),
             "model" => pick(&self.model),

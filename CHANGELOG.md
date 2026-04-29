@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-04-29
+
+### Added
+
+- Dotted layout entries `quotas.hourly`, `quotas.weekly`, `quotas.design`,
+  `quotas.sonnet`. Each addresses a single quota bucket so users can place
+  buckets at distinct layout positions, e.g.
+  `right = ["burn", "quotas.hourly", "ctx_bar", "quotas.weekly", "model"]`.
+  The bare `quotas` entry continues to render every configured bucket
+  joined with the existing `·` separator. Default priorities for the
+  dotted entries are higher than the bare parent (25 / 20 / 18 / 17 vs 15)
+  since explicitly-placed buckets are user-elevated.
+- Per-bucket layout knobs: `[quotas.hourly] priority = 30` (and `min`,
+  `required`, `default`, `sizes`) now flow through. The bucket sub-section
+  is a `BucketConfig` carrying both the percent fields (`mode`/`width`/...)
+  and the common `ComponentConfig` fields. (#16, closes #16)
+
+### Changed
+
+- `QuotasConfig.{hourly,weekly,design,sonnet}` field type changed from
+  `Option<PctConfig>` to `Option<BucketConfig>`. The on-disk TOML format
+  is unchanged — both `PctConfig` and `ComponentConfig` deserialize via
+  `serde(flatten)` so existing `[quotas.hourly] mode = "hbar"` configs
+  parse unchanged.
+
 ## [0.1.9] - 2026-04-29
 
 ### Added
