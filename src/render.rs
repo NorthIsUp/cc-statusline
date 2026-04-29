@@ -6,6 +6,7 @@ use crate::git::{CiState, GitData};
 use crate::glyphs::*;
 use crate::input::Session;
 use crate::quota::{self, WIN_5H, WIN_7D};
+use crate::template::{self, LayoutContext};
 use crate::transcript::{AgentCount, BurnInfo, OtherPrs};
 use crate::vlen;
 
@@ -18,6 +19,24 @@ pub fn build(
     tick: u64,
 ) -> String {
     let cols = effective_cols(session.cols);
+    let cfg = crate::config::config();
+
+    // If the user provided a template, build a LayoutContext and evaluate.
+    // Otherwise fall back to the existing hardcoded layout for full backwards
+    // compatibility — the existing test exercises this path.
+    if cfg.left_template().is_some() || cfg.right_template().is_some() {
+        let ctx = build_layout_context(session, git, other, burn, agents, tick);
+        let left = cfg
+            .left_template()
+            .map(|t| template::eval(t, &ctx))
+            .unwrap_or_default();
+        let right = cfg
+            .right_template()
+            .map(|t| template::eval(t, &ctx))
+            .unwrap_or_default();
+        return assemble_template(&left, &right, cols, cfg.soft_wrap_cols());
+    }
+
     let mut left = build_left(session, git, other);
     let right = build_right(session, burn, agents, tick);
     let chip_compact = build_chip_compact(other, &git.pr.url);
@@ -546,6 +565,365 @@ mod tests {
             );
         }
     }
+
+    /// When the rendered single-line width would exceed `soft_wrap_cols`, the
+    /// right pane is pushed to a second line, right-aligned to `cols`.
+    #[test]
+    fn assemble_template_soft_wraps_when_too_wide() {
+        unsafe {
+            std::env::set_var("CC_STATUSLINE_NF_WIDTH", "1");
+        }
+        // Plain ASCII left/right; lengths sum well past soft_wrap_cols.
+        let left = "L".repeat(100);
+        let right = "R".repeat(100);
+        let cols = 200u32;
+        let soft_wrap_cols = 160u32;
+        let out = assemble_template(&left, &right, cols, soft_wrap_cols);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "expected 2 lines, got {out:?}");
+        assert_eq!(lines[0], left, "line 1 should be left pane only");
+        let line2 = lines[1];
+        assert!(!line2.is_empty(), "line 2 should be non-empty");
+        // Right-aligned to `cols`: total visible width == cols, ends with right.
+        let line2_width = vlen::vlen(line2);
+        assert_eq!(line2_width, cols, "line 2 width = cols");
+        assert!(
+            line2.ends_with(&right),
+            "line 2 should end with right pane ({line2:?})"
+        );
+    }
+}
+
+/// Right-align `left` and `right` to `cols` cells. If the combined width
+/// exceeds `soft_wrap_cols`, push `right` to a second line, right-aligned to
+/// `cols`. If left+gap+right doesn't fit on one line, truncate left (same
+/// strategy as the legacy assemble path).
+fn assemble_template(left: &str, right: &str, cols: u32, soft_wrap_cols: u32) -> String {
+    let llen = vlen::vlen(left);
+    let rlen = vlen::vlen(right);
+    let gap: u32 = 2;
+    let total = llen + rlen + gap;
+
+    // Soft-wrap: rendered single line would exceed `soft_wrap_cols`. Push the
+    // entire right pane to a second line, right-aligned to `cols`.
+    if soft_wrap_cols > 0 && total > soft_wrap_cols {
+        let mut out = String::new();
+        if left.is_empty() {
+            let pad_n = cols.saturating_sub(rlen) as usize;
+            out.push_str(&" ".repeat(pad_n));
+            out.push_str(right);
+        } else {
+            out.push_str(left);
+            if !right.is_empty() {
+                out.push('\n');
+                let pad_n = cols.saturating_sub(rlen) as usize;
+                out.push_str(&" ".repeat(pad_n));
+                out.push_str(right);
+            }
+        }
+        return out;
+    }
+
+    let mut out = String::new();
+    if left.is_empty() && right.is_empty() {
+        return out;
+    } else if left.is_empty() {
+        let pad_n = (cols.saturating_sub(rlen + 1)).max(1) as usize;
+        out.push_str(&format!("{DIM}·{RESET}{}{right}", " ".repeat(pad_n)));
+    } else if right.is_empty() {
+        out.push_str(left);
+    } else if total <= cols {
+        let pad_n = cols.saturating_sub(llen + rlen).max(gap) as usize;
+        out.push_str(&format!("{left}{}{right}", " ".repeat(pad_n)));
+    } else {
+        let budget = cols.saturating_sub(rlen + gap + 1);
+        let stripped = vlen::strip(left);
+        let truncated = vlen::truncate_to_width(&stripped, budget);
+        let left_out = format!("{truncated}{DIM}…{RESET}");
+        let llen2 = vlen::vlen(&left_out);
+        let pad_n = cols.saturating_sub(llen2 + rlen).max(gap) as usize;
+        out.push_str(&format!("{left_out}{}{right}", " ".repeat(pad_n)));
+    }
+    out
+}
+
+/// Build a `LayoutContext` populated with all supported variables (and
+/// variants) for the given session/git/transcript snapshot. Each value is a
+/// pre-rendered string, possibly empty (which makes adjacent template
+/// whitespace collapse).
+fn build_layout_context(
+    session: &Session,
+    git: &GitData,
+    other: &OtherPrs,
+    burn: &BurnInfo,
+    agents: &AgentCount,
+    tick: u64,
+) -> LayoutContext {
+    let mut c = LayoutContext::new();
+
+    // ── repo / location ─────────────────────────────────────────────────
+    let loc_disp = compute_loc_disp(session, git);
+    c.set(
+        "repo",
+        if loc_disp.is_empty() {
+            String::new()
+        } else {
+            format!("{DIM}{loc_disp}{RESET}")
+        },
+    );
+
+    // ── PR icon + state-colored ─────────────────────────────────────────
+    let (icon_glyph, state_color) = match git.pr.state.as_str() {
+        "MERGED" => (MERGED, FG_GH_MERGED),
+        "CLOSED" => (PR_CLOSED, FG_GH_CLOSED),
+        "OPEN" if git.pr.is_draft => (PR_DRAFT, FG_GH_DRAFT),
+        "OPEN" => (PR_OPEN, FG_GH_OPEN),
+        _ => (BRANCH, DIM),
+    };
+    c.set(
+        "pr_icon",
+        if git.branch.is_empty() {
+            String::new()
+        } else {
+            format!("{state_color}{icon_glyph}{RESET}")
+        },
+    );
+
+    // ── branch (linked to PR url when available) ────────────────────────
+    if git.branch.is_empty() {
+        c.set("branch", "");
+        c.set("pr_num", "");
+    } else {
+        let label_plain = git.branch.clone();
+        let branch_str = if !git.pr.url.is_empty() {
+            link(&git.pr.url, &label_plain)
+        } else {
+            label_plain
+        };
+        c.set("branch", branch_str);
+        c.set(
+            "pr_num",
+            git.pr
+                .number
+                .map(|n| format!(" {state_color}#{n}{RESET}"))
+                .unwrap_or_default(),
+        );
+    }
+
+    // ── ci ──────────────────────────────────────────────────────────────
+    let ci_raw = match git.ci_state() {
+        CiState::Pass => format!("{FG_GREEN}{CI_PASS}{RESET}"),
+        CiState::Fail => format!("{FG_RED}{CI_FAIL}{RESET}"),
+        CiState::Pend => format!("{FG_YELLOW}{CI_PEND}{RESET}"),
+        CiState::None => String::new(),
+    };
+    let ci_out = if !ci_raw.is_empty() && !git.pr.url.is_empty() {
+        link(&format!("{}/checks", git.pr.url), &ci_raw)
+    } else {
+        ci_raw
+    };
+    c.set("ci", ci_out);
+
+    // ── review ──────────────────────────────────────────────────────────
+    c.set(
+        "review",
+        match git.pr.review_decision.as_str() {
+            "APPROVED" => format!("{FG_GREEN}{APPROVED}{RESET}"),
+            "CHANGES_REQUESTED" => format!("{FG_RED}{CHANGES}{RESET}"),
+            _ => String::new(),
+        },
+    );
+
+    // ── comments ────────────────────────────────────────────────────────
+    let comments_n = git.pr.comments.len();
+    c.set(
+        "comments",
+        if comments_n > 0 {
+            format!("{COMMENT}{comments_n}")
+        } else {
+            String::new()
+        },
+    );
+
+    // ── dirty / ahead / behind ──────────────────────────────────────────
+    c.set(
+        "dirty",
+        if git.dirty > 0 {
+            format!("{FG_YELLOW}{DIRTY}{}{RESET}", git.dirty)
+        } else {
+            String::new()
+        },
+    );
+    c.set(
+        "ahead",
+        if git.ahead > 0 {
+            format!("{DIM}{AHEAD}{}{RESET}", git.ahead)
+        } else {
+            String::new()
+        },
+    );
+    c.set(
+        "behind",
+        if git.behind > 0 {
+            format!("{FG_YELLOW}{BEHIND}{}{RESET}", git.behind)
+        } else {
+            String::new()
+        },
+    );
+
+    // ── linear ticket ───────────────────────────────────────────────────
+    c.set(
+        "ticket",
+        if let Some(t) = crate::git::extract_ticket(&git.branch) {
+            let url = crate::git::linear_url(&t);
+            let label = format!("[{t}]");
+            format!("{FG_CYAN}{}{RESET}", link(&url, &label))
+        } else {
+            String::new()
+        },
+    );
+
+    // ── burn rate ───────────────────────────────────────────────────────
+    let burn_str = if burn.tokens_per_hour > 0 {
+        let n = burn.tokens_per_hour;
+        let human = if n >= 1_000_000 {
+            format!("{:.1}M", n as f64 / 1_000_000.0)
+        } else if n >= 1_000 {
+            format!("{}k", (n as f64 / 1_000.0).round() as u64)
+        } else {
+            format!("{n}")
+        };
+        format!("{DIM}Σ{RESET} {human}{DIM}/hr{RESET}")
+    } else {
+        String::new()
+    };
+    c.set("burn", burn_str);
+
+    // ── agents ──────────────────────────────────────────────────────────
+    let agent_str = if agents.total > 0 {
+        if agents.active > 0 {
+            format!(
+                "{FG_YELLOW}{AGENT}{RESET} {}{DIM}/{}{RESET}",
+                agents.active, agents.total
+            )
+        } else {
+            format!("{DIM}{AGENT} {}{RESET}", agents.total)
+        }
+    } else {
+        String::new()
+    };
+    c.set("agents", agent_str);
+
+    // ── quotas ──────────────────────────────────────────────────────────
+    let q5h = quota::fmt_quota(session.r5h, session.r5h_reset, WIN_5H, CLOCK_5H);
+    let q7d = quota::fmt_quota(session.r7d, session.r7d_reset, WIN_7D, CALENDAR_7D);
+    let mut quota_str = String::new();
+    if !q5h.is_empty() {
+        quota_str.push_str(&q5h);
+    }
+    if !q7d.is_empty() {
+        if !quota_str.is_empty() {
+            quota_str.push_str(&format!(" {DIM}·{RESET} "));
+        }
+        quota_str.push_str(&q7d);
+    }
+    c.set("quotas", quota_str);
+
+    // ── ctx bar + pct ───────────────────────────────────────────────────
+    let bar = build_bar(session.ctx_pct);
+    c.set(
+        "ctx",
+        format!("{DIM}{CTX}{RESET} {bar} {}%", session.ctx_pct),
+    );
+
+    // ── location icon ───────────────────────────────────────────────────
+    c.set("loc", location_icon());
+
+    // ── model (with variants) ───────────────────────────────────────────
+    let model_long = format!("{BOLD}{}{RESET}", session.model);
+    let model_short_label: String = session.model.chars().take(6).collect();
+    let model_short = format!("{BOLD}{model_short_label}{RESET}");
+    c.set("model", model_long.clone());
+    c.set_variant("model", "long", model_long);
+    c.set_variant("model", "short", model_short);
+
+    // ── effort (with variants) ──────────────────────────────────────────
+    let (effort_color, effort_label) = match session.effort.as_str() {
+        "high" => (FG_RED, "L"),
+        "medium" => (FG_YELLOW, "M"),
+        "low" => (FG_GREEN, "S"),
+        "minimal" => (FG_GREEN, "XS"),
+        "" => (DIM, ""),
+        other => (DIM, other),
+    };
+    if effort_label.is_empty() {
+        c.set("effort", "");
+        c.set_variant("effort", "icon", "");
+        c.set_variant("effort", "short", "");
+    } else {
+        c.set(
+            "effort",
+            format!("{effort_color}{EFFORT} {effort_label}{RESET}"),
+        );
+        c.set_variant("effort", "icon", format!("{effort_color}{EFFORT}{RESET}"));
+        c.set_variant(
+            "effort",
+            "short",
+            format!("{effort_color}{effort_label}{RESET}"),
+        );
+    }
+
+    // ── spinner ─────────────────────────────────────────────────────────
+    c.set("spinner", format!("{DIM}{}{RESET}", spinner_text(tick)));
+
+    // ── chips (other PRs) ───────────────────────────────────────────────
+    let chip_compact = build_chip_compact(other, &git.pr.url);
+    let chip_expanded = build_chip_expanded(other, &git.pr.url);
+    c.set("chips", chip_compact.clone());
+    c.set_variant("chips", "compact", chip_compact);
+    c.set_variant("chips", "expanded", chip_expanded);
+
+    c
+}
+
+fn compute_loc_disp(session: &Session, git: &GitData) -> String {
+    let mut loc_disp = String::new();
+    if !git.origin_url.is_empty() {
+        loc_disp = pretty_repo(&git.origin_url);
+        if let (Some(gd), Some(cd), Some(top)) = (&git.git_dir, &git.common_dir, &git.toplevel) {
+            if let (Ok(g_abs), Ok(c_abs)) = (gd.canonicalize(), cd.canonicalize()) {
+                if g_abs != c_abs {
+                    let wt_name = top
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    if !wt_name.is_empty() && wt_name != git.branch {
+                        loc_disp.push_str(&format!(
+                            " {FG_CYAN}{WORKTREE}{RESET}{DIM} {wt_name}{RESET}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if loc_disp.is_empty() {
+        let cwd = if !session.cwd.is_empty() {
+            session.cwd.clone()
+        } else {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        let home = std::env::var("HOME").unwrap_or_default();
+        loc_disp = if !home.is_empty() && cwd == home {
+            "~".into()
+        } else if !home.is_empty() && cwd.starts_with(&format!("{home}/")) {
+            format!("~{}", &cwd[home.len()..])
+        } else {
+            cwd
+        };
+    }
+    loc_disp
 }
 
 fn spinner_text(tick: u64) -> String {

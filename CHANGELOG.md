@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Configurable layout templates (Starship-style). Set `left` / `right` in
+  `config.toml` with `${name}` / `${name:variant}` placeholders to customise
+  segment order and content. Empty variables collapse adjacent literal
+  whitespace so optional segments don't leave stray spaces. New
+  `soft_wrap_cols` config (default `160`) pushes the right pane onto a
+  second line, right-aligned, when the rendered width would exceed the
+  threshold. Default behaviour unchanged when `left`/`right` are unset.
+  (#1)
+
 ## [0.1.3] - 2026-04-28
 
 ### Added

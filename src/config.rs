@@ -17,6 +17,15 @@ pub struct Config {
     pub debug_focus_log: Option<bool>,
     pub spinner: Option<String>,
     pub recent_prs_ttl: Option<i64>,
+    /// Layout template for the left pane. When unset, the built-in hardcoded
+    /// layout is used (existing behaviour). Syntax: `${name}` or `${name:variant}`.
+    pub left: Option<String>,
+    /// Layout template for the right pane. See `left`.
+    pub right: Option<String>,
+    /// When the rendered single line's visible width exceeds this threshold,
+    /// the right pane is pushed to a second line, right-aligned to `cols`.
+    /// Only applies when at least one of `left`/`right` is set.
+    pub soft_wrap_cols: Option<u32>,
 }
 
 impl Config {
@@ -69,6 +78,15 @@ impl Config {
     }
     pub fn spinner(&self) -> String {
         self.spinner.clone().unwrap_or_else(|| "compact".into())
+    }
+    pub fn left_template(&self) -> Option<&str> {
+        self.left.as_deref()
+    }
+    pub fn right_template(&self) -> Option<&str> {
+        self.right.as_deref()
+    }
+    pub fn soft_wrap_cols(&self) -> u32 {
+        self.soft_wrap_cols.unwrap_or(160)
     }
 }
 

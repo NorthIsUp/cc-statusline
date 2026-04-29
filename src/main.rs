@@ -38,6 +38,7 @@ mod recent_prs;
 mod refresh;
 mod render;
 mod state;
+mod template;
 mod transcript;
 mod vlen;
 
