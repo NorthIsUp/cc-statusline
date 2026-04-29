@@ -28,3 +28,12 @@ debug_focus_log = true
 #   "epoch-N"  – last N digits of the wall-clock epoch (e.g. "epoch-3" → "535")
 #                The 1's digit changes every second, guaranteeing visible motion.
 spinner = "compact"
+
+# Layout templates (Starship-style). Uncomment to customise segment order /
+# content. Empty variables collapse adjacent literal whitespace.
+# left  = "${repo} ${branch}${pr_num} ${ci}${review}${comments} ${dirty}${ahead}${behind} ${ticket}"
+# right = "${burn} · ${agents} · ${quotas} ${ctx} ${loc} [${model:long} · ${effort:icon}${effort:short}] ${spinner}"
+
+# When the rendered single line exceeds this width, the right pane is
+# pushed to a second line, right-aligned to the terminal width.
+# soft_wrap_cols = 160

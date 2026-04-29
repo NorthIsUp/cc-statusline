@@ -55,6 +55,34 @@ State per session lives at `$XDG_CACHE_HOME/cc-statusbar/<session_id>.toml`.
 A shared `recent_prs.toml` holds one GraphQL response that hydrates chip
 colors across every session.
 
+## Layout templates
+
+Customise segment order and content with Starship-style placeholders. Set
+`left` and `right` in `config.toml`; when either is set, the built-in
+hardcoded layout is replaced by your template.
+
+```toml
+left  = "${repo} ${branch}${pr_num} ${ci}${review}${comments} ${dirty}${ahead}${behind} ${ticket}"
+right = "${burn} · ${agents} · ${quotas} ${ctx} ${loc} [${model:long} · ${effort:icon}${effort:short}] ${spinner}"
+
+# When the rendered single line would exceed this width, push the right
+# pane to line 2, right-aligned to the terminal width.
+soft_wrap_cols = 160
+```
+
+Syntax:
+
+- `${name}` resolves to the variable's default form.
+- `${name:variant}` resolves to a named variant (falls back to default if
+  the variant isn't defined).
+- Empty variables collapse adjacent literal whitespace so optional segments
+  don't leave stray spaces.
+
+Variables: `repo`, `branch`, `pr_num`, `pr_icon`, `ci`, `review`,
+`comments`, `dirty`, `ahead`, `behind`, `ticket`, `burn`, `agents`,
+`quotas`, `ctx`, `loc`, `model` (`:long`, `:short`), `effort` (`:icon`,
+`:short`), `spinner`, `chips` (`:compact`, `:expanded`).
+
 ## Releasing
 
 1. Add a `## [X.Y.Z] - YYYY-MM-DD` section to `CHANGELOG.md`.
