@@ -3,6 +3,7 @@
 
 use crate::cache::now_epoch;
 use crate::glyphs::{DIM, FG_RED, FG_YELLOW, RESET};
+use crate::pct::{self, PctConfig};
 
 pub const WIN_5H: i64 = 18_000;
 pub const WIN_7D: i64 = 604_800;
@@ -87,13 +88,25 @@ pub fn reset_str(reset: i64) -> String {
     format!("{} {}", clock.trim_start(), dur)
 }
 
-pub fn fmt_quota(p: Option<u32>, reset: Option<i64>, window: i64, label: &str) -> String {
+/// Render a single quota window. The percent visual is delegated to
+/// `pct::render_plain` using `pct_cfg`, so callers can swap between text
+/// (`percent`/`float`) and bar visuals (`dots`/`shaded`/`hbar`/`vbar`). The
+/// reset-time suffix is unconditional (when present) and lives outside the
+/// mode-rendered glyph: `<glyph> <pct-rendered> (<reset>)`.
+pub fn fmt_quota(
+    p: Option<u32>,
+    reset: Option<i64>,
+    window: i64,
+    label: &str,
+    pct_cfg: &PctConfig,
+) -> String {
     let p = match p {
         Some(p) => p,
         None => return String::new(),
     };
     let c = pct_color(p, reset, window);
-    let mut out = format!("{c}{label} {p}%");
+    let body = pct::render_plain(p, pct_cfg);
+    let mut out = format!("{c}{label} {body}");
     if p >= 80 {
         if let Some(r) = reset {
             out.push_str(&format!(" ({})", reset_str(r)));

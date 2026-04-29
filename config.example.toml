@@ -74,12 +74,51 @@ overflow_chips_to_second_row = true
 #
 # Component-specific fields are documented per block below.
 
+# ─── Shared percent-display modes ──────────────────────────────────────────
+#
+# Every percent-aware component (`ctx_bar`, `quotas`, `burn`) shares the same
+# `mode` knob plus optional `width`/`filled`/`empty` overrides. Available
+# modes:
+#
+#   "percent"  -> "47%"
+#   "float"    -> "0.47"
+#   "dots"     -> single cell, 9 levels:  ⠀⡀⡄⡆⡇⣇⣧⣷⣿
+#   "shaded"   -> single cell, 5 levels:  ' ░▒▓█'
+#   "hbar"     -> multi-cell horizontal bar with sub-cell precision via
+#                 ▏▎▍▌▋▊▉█ (configurable via `width`/`filled`/`empty`)
+#   "vbar"     -> single cell, 8 vertical levels: ▁▂▃▄▅▆▇█
+#
+# `width` only matters for `hbar`. `filled`/`empty` only matter for `hbar`
+# (they're ignored in every other mode but still parse cleanly for back-compat
+# with older configs).
+
 [ctx_bar]
 priority = 90
 default  = "m"
-width    = 10
-filled   = "▓"
-empty    = "░"
+# mode = "percent"   # default — just renders "47%"
+# mode = "hbar"      # multi-cell bar, sub-cell precision
+# mode = "dots"      # one-cell braille meter
+# mode = "shaded"    # one-cell shade ramp
+# mode = "vbar"      # one-cell vertical bar
+# mode = "float"     # "0.47"
+# width  = 10
+# filled = "█"
+# empty  = " "
+
+[quotas]
+# Same `mode` options as ctx_bar. Reset-time suffix (e.g. "(2h30m)") is
+# appended regardless of mode, so switching to `dots`/`hbar` doesn't lose
+# the reset clock.
+# mode = "percent"
+
+[burn]
+priority = 8
+# `burn` doesn't have a native percent — it's derived from
+# `tokens_per_hour / max_tokens_per_hour`. The text modes (`percent`,
+# `float`) keep the legacy `Σ 1.5M/hr` rendering. The visual modes
+# (`dots`/`shaded`/`hbar`/`vbar`) replace the text with a colored meter.
+# mode = "percent"
+# max_tokens_per_hour = 5_000_000
 
 [chips]
 priority = 5
@@ -98,9 +137,6 @@ stack_refresh_ttl = 60
 
 [model]
 priority = 80
-
-[burn]
-priority = 8
 
 [spinner]
 priority = 100
