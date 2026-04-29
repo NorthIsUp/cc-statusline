@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-04-29
+
+### Added
+
+- Per-bucket `[quotas]` configuration. Sub-sections under `[quotas]`,
+  each a full `PctConfig` that overrides the parent defaults for that
+  bucket only:
+  - `[quotas.hourly]` — 5-hour bucket (`rate_limits.five_hour`)
+  - `[quotas.weekly]` — 7-day bucket (`rate_limits.seven_day`)
+  - `[quotas.design]` — placeholder for future design-partner quota
+  - `[quotas.sonnet]` — placeholder for future sonnet model quota
+  Top-level `[quotas]` keys (`mode`/`width`/`filled`/`empty`) act as defaults
+  applied to every bucket; sub-sections override wholesale. Existing flat
+  `[quotas] mode = "..."` configs continue to work unchanged.
+  (#12, closes #12)
+- New Nerd Font glyphs `DESIGN_Q` (`nf-md-palette`) and `SONNET_Q`
+  (`nf-md-music_note`) reserved for the design and sonnet quota labels
+  once the upstream session-JSON schema exposes those buckets.
+
+### Notes
+
+- The `design` and `sonnet` sub-sections are config plumbing only — the
+  upstream session-JSON schema for those buckets is not yet documented,
+  so the corresponding `Session` input fields are deliberately omitted.
+  Follow-up work will capture a real session JSON to discover the paths.
+
 ## [0.1.8] - 2026-04-29
 
 ### Added

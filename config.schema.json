@@ -573,6 +573,30 @@
         }
       }
     },
+    "PctConfig": {
+      "type": "object",
+      "properties": {
+        "empty": {
+          "description": "Override for the empty-cell glyph in `hbar` mode. Defaults to a single space so the bar reads cleanly as \"filled to here, empty after\".",
+          "default": " ",
+          "type": "string"
+        },
+        "filled": {
+          "description": "Override for the full-cell glyph in `hbar` mode. Defaults to `█`.",
+          "default": "█",
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/definitions/PctMode"
+        },
+        "width": {
+          "default": 10,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
     "PctMode": {
       "type": "string",
       "enum": [
@@ -585,7 +609,7 @@
       ]
     },
     "QuotasConfig": {
-      "description": "Per-component config for `quotas`. Inherits the shared `[pct]` knobs (`mode`, `width`, `filled`, `empty`). Default mode is `percent` to preserve the legacy `<glyph> 47%` text. The reset-time suffix is appended by `quota::fmt_quota` regardless of mode, so users can switch the percent visual to `dots`/`hbar` without losing the reset clock.",
+      "description": "Per-component config for `quotas`. Top-level keys (`mode`, `width`, `filled`, `empty`) act as defaults applied to every bucket; per-bucket sub-sections (`[quotas.hourly]`, `[quotas.weekly]`, `[quotas.design]`, `[quotas.sonnet]`) override those defaults for that bucket only.\n\nDefault mode is `percent` to preserve the legacy `<glyph> 47%` text. The reset-time suffix is appended by `quota::fmt_quota` regardless of mode, so users can switch the percent visual to `dots`/`hbar` without losing the reset clock.",
       "type": "object",
       "properties": {
         "default": {
@@ -593,6 +617,17 @@
           "anyOf": [
             {
               "$ref": "#/definitions/Size"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "design": {
+          "description": "Override for the design-partner bucket.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PctConfig"
             },
             {
               "type": "null"
@@ -608,6 +643,17 @@
           "description": "Override for the full-cell glyph in `hbar` mode. Defaults to `█`.",
           "default": "█",
           "type": "string"
+        },
+        "hourly": {
+          "description": "Override for the 5-hour bucket (`rate_limits.five_hour`).",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PctConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "min": {
           "description": "Don't shrink past this size. None = component's smallest.",
@@ -641,6 +687,28 @@
           "items": {
             "$ref": "#/definitions/Size"
           }
+        },
+        "sonnet": {
+          "description": "Override for the sonnet model bucket.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PctConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "weekly": {
+          "description": "Override for the 7-day bucket (`rate_limits.seven_day`).",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PctConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "width": {
           "default": 10,
