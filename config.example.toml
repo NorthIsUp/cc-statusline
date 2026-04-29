@@ -59,6 +59,9 @@ right = [
 gap = 2
 autoresize = true
 hysteresis_band = 2
+# When chips collapses to its compact `×N` form, render the expanded
+# `#a #b #c …` chain on a second row. Disable to keep the bar one line.
+overflow_chips_to_second_row = true
 
 # ─── Per-component config ──────────────────────────────────────────────────
 #

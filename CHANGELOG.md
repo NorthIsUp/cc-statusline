@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-04-29
+
+### Added
+
+- Two-line overflow for the `chips` component: when the layout engine
+  collapses chips to its compact `×N` form (because the expanded `#a #b
+  #c …` chain wouldn't fit alongside the rest of the bar), the expanded
+  chain is now rendered on a second row, left-aligned and right-padded
+  to the terminal width. Line 1 is unchanged. Stack ordering is honored
+  on line 2 when `is_gt`, and per-chip OSC-8 hyperlinks are preserved.
+  Disabled with `overflow_chips_to_second_row = false` in the `[layout]`
+  block. Suppressed when there are fewer than 2 chips. (#8, closes #8)
+
 ## [0.1.4] - 2026-04-29
 
 ### Added
