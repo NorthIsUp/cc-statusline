@@ -28,17 +28,19 @@
 )]
 
 mod cache;
+mod component;
+mod components;
 mod config;
 mod focus;
 mod git;
 mod glyphs;
 mod input;
+mod layout;
 mod quota;
 mod recent_prs;
 mod refresh;
 mod render;
 mod state;
-mod template;
 mod transcript;
 mod vlen;
 
@@ -98,7 +100,15 @@ fn render_once() {
     let burn = transcript::burn_rate(&session, &mut handle.state);
     let agents = transcript::agent_counter(&session, &mut handle.state);
 
-    let line = render::build(&session, &git, &other, &burn, &agents, handle.state.tick);
+    let line = render::build_with_state(
+        &session,
+        &git,
+        &other,
+        &burn,
+        &agents,
+        handle.state.tick,
+        &mut handle.state,
+    );
     println!("{line}");
 
     let _ = handle.save();

@@ -9,14 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Configurable layout templates (Starship-style). Set `left` / `right` in
-  `config.toml` with `${name}` / `${name:variant}` placeholders to customise
-  segment order and content. Empty variables collapse adjacent literal
-  whitespace so optional segments don't leave stray spaces. New
-  `soft_wrap_cols` config (default `160`) pushes the right pane onto a
-  second line, right-aligned, when the rendered width would exceed the
-  threshold. Default behaviour unchanged when `left`/`right` are unset.
-  (#1)
+- Composable component model. Every statusline element now implements a
+  `Component` trait with declared size variants (`xs`/`s`/`m`/`l`/`xl`)
+  and per-component config (`priority`, `min`, `sizes`, `required`). New
+  `[layout]` block in `config.toml` declares the left/right component
+  lists, gap, autoresize toggle, and hysteresis band. The layout engine
+  renders at default sizes, then iteratively shrinks lowest-priority
+  components and finally drops them until the line fits the terminal
+  width. Hysteresis decisions persist across renders to prevent
+  oscillation when nudge-resizing. (#5, closes #5)
+- Per-component `[ctx_bar]` config: `width`, `filled`, `empty`, plus the
+  shared `priority`/`min`/`sizes`/`required`/`default` knobs.
+
+### Changed
+
+- Default left/right layouts produce the same visual output as the
+  previous hardcoded layout at width 200+. Existing screenshots unchanged.
+
+### Removed
+
+- The Starship-style template DSL (`${name:variant}` substitutions, `left`
+  and `right` template strings, `soft_wrap_cols`) is replaced by the
+  declarative `[layout]` config. The `template.rs` module is deleted.
+- All ad-hoc width gates (`if cols >= 130/110/90`) and bespoke shrink
+  helpers (`strip_repo_prefix`, `strip_right_optional`,
+  `strip_chip_suffix`). The chip-attach try-loop is gone — chips is just
+  another component with size variants.
 
 ## [0.1.3] - 2026-04-28
 

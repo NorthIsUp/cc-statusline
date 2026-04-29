@@ -43,7 +43,6 @@ Drop a config at `$XDG_CONFIG_HOME/cc-statusbar/config.toml` (or
 linear_workspace    = "teamclara"   # used for [TICKET] hyperlinks
 safety_margin       = 0             # cells subtracted from terminal width
 nerd_font_width     = 2             # cell width of Nerd Font PUA glyphs
-pr_expand_min_cols  = 160           # cols to expand "×N" → "#N1 #N2 …"
 pr_cache_ttl        = 60            # seconds, current-branch PR
 other_cache_ttl     = 600           # seconds, "other PRs" URL list
 recent_prs_ttl      = 20            # seconds, global gh api graphql cache
@@ -55,33 +54,61 @@ State per session lives at `$XDG_CACHE_HOME/cc-statusbar/<session_id>.toml`.
 A shared `recent_prs.toml` holds one GraphQL response that hydrates chip
 colors across every session.
 
-## Layout templates
+## Layout
 
-Customise segment order and content with Starship-style placeholders. Set
-`left` and `right` in `config.toml`; when either is set, the built-in
-hardcoded layout is replaced by your template.
+Every statusline element is a `Component` with declared size variants
+(`xs`/`s`/`m`/`l`/`xl`) and a per-component config block. The layout
+engine renders at default sizes, then iteratively shrinks
+lowest-priority components — and finally drops them — until the line
+fits the terminal width.
+
+The `[layout]` block declares which components appear and in what order:
 
 ```toml
-left  = "${repo} ${branch}${pr_num} ${ci}${review}${comments} ${dirty}${ahead}${behind} ${ticket}"
-right = "${burn} · ${agents} · ${quotas} ${ctx} ${loc} [${model:long} · ${effort:icon}${effort:short}] ${spinner}"
-
-# When the rendered single line would exceed this width, push the right
-# pane to line 2, right-aligned to the terminal width.
-soft_wrap_cols = 160
+[layout]
+left  = ["repo", "pr_icon", "branch", "pr_num", "ci", "review",
+         "comments", "dirty", "ahead", "behind", "ticket", "chips"]
+right = ["burn", "agents", "quotas", "ctx_bar", "loc", "model",
+         "effort", "spinner"]
+gap             = 2
+autoresize      = true
+hysteresis_band = 2
 ```
 
-Syntax:
+Each component accepts a `[name]` block with the common config:
 
-- `${name}` resolves to the variable's default form.
-- `${name:variant}` resolves to a named variant (falls back to default if
-  the variant isn't defined).
-- Empty variables collapse adjacent literal whitespace so optional segments
-  don't leave stray spaces.
+```toml
+[ctx_bar]
+priority = 90        # higher = shrunk LAST
+default  = "m"       # size before autoresize kicks in
+min      = "s"       # never shrink past this size
+sizes    = ["s", "m", "l"]   # whitelist allowed sizes
+required = true              # never drop entirely
+# component-specific knobs:
+width  = 10
+filled = "▓"
+empty  = "░"
+```
 
-Variables: `repo`, `branch`, `pr_num`, `pr_icon`, `ci`, `review`,
-`comments`, `dirty`, `ahead`, `behind`, `ticket`, `burn`, `agents`,
-`quotas`, `ctx`, `loc`, `model` (`:long`, `:short`), `effort` (`:icon`,
-`:short`), `spinner`, `chips` (`:compact`, `:expanded`).
+Sizes a component may render at, smallest to largest:
+
+| Component | xs | s | m | l | xl |
+|---|---|---|---|---|---|
+| `ctx_bar` | one cell | `71%` | `▓▓▓░░░ 71%` | `⛁ ▓▓▓░░░ 71%` | `Σ ▓▓▓░░░ 71% / 200k tokens` |
+| `repo` | _empty_ | basename | `org/repo` | — | `host/org/repo` |
+| `branch` | _empty_ | truncated | full | — | full |
+| `model` | initial | first word | first word | — | full name |
+| `effort` | `⚡` | — | `⚡ M` | — | `⚡ Medium` |
+| `chips` | _empty_ | `×N` | `×N` | — | `#1 #2 …` |
+| `burn` | _empty_ | — | `Σ 12.3M` | — | `Σ 12.3M/hr` |
+
+The other components (`pr_icon`, `pr_num`, `ci`, `review`, `comments`,
+`dirty`, `ahead`, `behind`, `ticket`, `agents`, `quotas`, `loc`,
+`spinner`) just render at `m` or omit themselves at `xs`.
+
+Hysteresis: once a component is shrunk at terminal width W, it stays
+shrunk while cols stays within ±`hysteresis_band` of W. Decisions
+persist in `state.toml` so the line doesn't oscillate as you nudge-resize.
 
 ## Releasing
 

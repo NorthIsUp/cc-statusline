@@ -36,6 +36,9 @@ pub struct State {
     /// re-renders that would skip / repeat frames if we used epoch seconds.
     #[serde(default)]
     pub tick: u64,
+    /// Layout-engine hysteresis state — sticky shrink decisions across renders.
+    #[serde(default)]
+    pub layout: crate::layout::LayoutState,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
