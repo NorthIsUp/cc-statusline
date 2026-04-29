@@ -2,7 +2,7 @@
 // Falls back to ~/.config/cc-statusbar/config.toml. Env vars override file.
 
 use crate::component::ComponentConfig;
-use crate::components::CtxBarConfig;
+use crate::components::{ChipsConfig, CtxBarConfig};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -93,7 +93,7 @@ pub struct Config {
     #[serde(default)]
     pub ticket: Option<ComponentConfig>,
     #[serde(default)]
-    pub chips: Option<ComponentConfig>,
+    pub chips: ChipsConfig,
     #[serde(default)]
     pub burn: Option<ComponentConfig>,
     #[serde(default)]
@@ -146,6 +146,9 @@ impl Config {
     pub fn other_cache_ttl(&self) -> i64 {
         self.other_cache_ttl.unwrap_or(600)
     }
+    pub fn stack_refresh_ttl(&self) -> i64 {
+        self.chips.stack_refresh_ttl
+    }
     pub fn recent_prs_ttl(&self) -> i64 {
         self.recent_prs_ttl.unwrap_or(20)
     }
@@ -175,7 +178,7 @@ impl Config {
             "ahead" => pick(&self.ahead),
             "behind" => pick(&self.behind),
             "ticket" => pick(&self.ticket),
-            "chips" => pick(&self.chips),
+            "chips" => self.chips.common.clone(),
             "burn" => pick(&self.burn),
             "agents" => pick(&self.agents),
             "quotas" => pick(&self.quotas),

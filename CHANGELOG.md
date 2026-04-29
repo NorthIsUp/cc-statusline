@@ -7,8 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-04-29
+
 ### Added
 
+- Render Graphite stacks in stack order in the chips component. When `gt` is
+  on `$PATH` and `gt log --json` succeeds in `$CWD`, chips are reordered
+  trunk → leaf, joined with a configurable separator (default `─•─`), and
+  prefixed by a configurable leading glyph (default the Nerd Font branch
+  glyph, dim cyan). PRs not reachable from the worktree's trunk are appended
+  after the stacked chain, sorted by ascending PR number — identical to the
+  legacy ordering — so non-stack workflows are unaffected. Detection runs
+  on the same detached `--refresh-*` path used for PR/other refreshes; the
+  foreground render never blocks on `gt`. Cached in the per-session state
+  TOML with a configurable TTL (`[chips].stack_refresh_ttl`, default 60s)
+  and a separate `locked_at` debounce to prevent thundering-herd `gt`
+  invocations. New `[chips]` config keys: `stack_separator`, `stack_glyph`
+  (set `""` to disable), `force_stack` (treat all sessions as gt-stacks),
+  `stack_refresh_ttl`. (#2, closes #2)
 - Composable component model. Every statusline element now implements a
   `Component` trait with declared size variants (`xs`/`s`/`m`/`l`/`xl`)
   and per-component config (`priority`, `min`, `sizes`, `required`). New

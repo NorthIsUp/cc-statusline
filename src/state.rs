@@ -29,6 +29,7 @@ pub struct State {
     pub focus: FocusState,
     pub pr: PrCache,
     pub other_prs: OtherPrCache,
+    pub stack: StackCache,
     pub burn: BurnCache,
     pub agents: AgentCache,
     /// Monotonic render counter. Drives the spinner so it advances exactly one
@@ -65,6 +66,34 @@ pub struct OtherPrCache {
     pub urls: Vec<String>,
     /// Raw JSON object: {url -> {state, isDraft}}.
     pub states_json: String,
+}
+
+/// Graphite stack snapshot for the current worktree. Populated asynchronously
+/// by `--refresh-other` (runs `gt log --json` in $CWD) and consumed by the
+/// chips component to render PRs in trunk→leaf order with stack separators.
+///
+/// `is_gt` is `true` only when `gt` is on $PATH AND `gt log --json` parsed
+/// cleanly into at least one entry. On any failure we leave it `false` and
+/// chips falls back to its legacy ascending-PR-number rendering — there is no
+/// error surface visible to the user.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StackCache {
+    pub fetched_at: i64,
+    pub locked_at: i64,
+    pub is_gt: bool,
+    /// Trunk-first list of branches in the stack reachable from the worktree.
+    pub entries: Vec<StackEntry>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StackEntry {
+    pub branch: String,
+    /// PR number, if Graphite knows about one for this branch.
+    pub pr: Option<u32>,
+    /// Distance from trunk; trunk is depth 0, first child is 1, etc.
+    pub depth: u32,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]

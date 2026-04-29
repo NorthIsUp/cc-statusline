@@ -396,6 +396,38 @@ impl Component for Ticket {
 
 // ─── chips (other PRs) ──────────────────────────────────────────────────
 
+/// `[chips]` config block. Common ComponentConfig fields (priority/min/sizes/
+/// required/default) live alongside chips-specific stack-mode knobs.
+///
+/// In stack mode (Graphite detected and ≥2 chip PRs covered by the stack),
+/// chips are reordered by depth and joined with `stack_separator`, prefixed
+/// by `stack_glyph` in dim cyan. Set `force_stack=true` to use the stack
+/// layout even without `gt`; set `stack_glyph=""` to suppress the leading
+/// glyph.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ChipsConfig {
+    pub stack_separator: String,
+    pub stack_glyph: String,
+    pub force_stack: bool,
+    pub stack_refresh_ttl: i64,
+    #[serde(flatten)]
+    pub common: crate::component::ComponentConfig,
+}
+
+impl Default for ChipsConfig {
+    fn default() -> Self {
+        Self {
+            stack_separator: "─•─".into(),
+            // Default to the Nerd Font branch glyph; users can clear via "".
+            stack_glyph: BRANCH.into(),
+            force_stack: false,
+            stack_refresh_ttl: 60,
+            common: crate::component::ComponentConfig::default(),
+        }
+    }
+}
+
 pub struct Chips;
 
 fn pr_color_for(other: &crate::transcript::OtherPrs, url: &str) -> &'static str {
@@ -416,8 +448,76 @@ fn chip_should_render(other: &crate::transcript::OtherPrs, current_url: &str) ->
     false
 }
 
+fn pr_num_from_url(url: &str) -> Option<u32> {
+    let rest = url.strip_prefix("https://github.com/")?;
+    let (_, num_part) = rest.split_once("/pull/")?;
+    num_part.split(['/', '?', '#']).next()?.parse().ok()
+}
+
+/// Order URLs for stack-mode rendering. Stack-covered PRs come first in
+/// trunk→leaf depth order; the rest are appended sorted by ascending PR
+/// number. Returns `None` when stack mode does not apply (no gt, or fewer
+/// than 2 chip URLs are covered by the stack and force_stack is false).
+fn stack_ordered_urls(
+    other: &crate::transcript::OtherPrs,
+    force_stack: bool,
+) -> Option<Vec<String>> {
+    if !other.is_gt && !force_stack {
+        return None;
+    }
+    // PR number → URL for the chip set. Multiple URLs with the same PR number
+    // are unlikely (cross-repo filtering already happened upstream).
+    let mut by_num: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    let mut leftover: Vec<String> = Vec::new();
+    for u in &other.urls {
+        match pr_num_from_url(u) {
+            Some(n) => {
+                by_num.insert(n, u.clone());
+            }
+            None => leftover.push(u.clone()),
+        }
+    }
+    // Walk stack entries in depth order, picking up matching chips.
+    let mut stacked_urls: Vec<String> = Vec::new();
+    let mut sorted_entries: Vec<&crate::transcript::StackChipEntry> =
+        other.stack_entries.iter().collect();
+    sorted_entries.sort_by_key(|e| e.depth);
+    let mut consumed: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for e in sorted_entries {
+        if let Some(pr) = e.pr {
+            if let Some(u) = by_num.get(&pr) {
+                stacked_urls.push(u.clone());
+                consumed.insert(pr);
+            }
+        }
+    }
+    // Require ≥2 covered chips for stack mode (unless forced) — a single
+    // matched chip is no improvement over the legacy ordering.
+    if !force_stack && stacked_urls.len() < 2 {
+        return None;
+    }
+    // Append uncovered chips, sorted by PR number ascending (legacy fallback).
+    let mut rest_pairs: Vec<(u32, String)> = by_num
+        .into_iter()
+        .filter(|(n, _)| !consumed.contains(n))
+        .collect();
+    rest_pairs.sort_by_key(|(n, _)| *n);
+    let mut out = stacked_urls;
+    for (_, u) in rest_pairs {
+        out.push(u);
+    }
+    out.extend(leftover);
+    Some(out)
+}
+
+fn render_chip(other: &crate::transcript::OtherPrs, url: &str) -> String {
+    let n = url.rsplit('/').next().unwrap_or("");
+    let c = pr_color_for(other, url);
+    link(url, &format!("{c}#{n}{RESET}"))
+}
+
 impl Component for Chips {
-    type Config = ();
+    type Config = ChipsConfig;
     fn name() -> &'static str {
         "chips"
     }
@@ -427,28 +527,47 @@ impl Component for Chips {
     fn default_size() -> Size {
         Size::Xl
     }
-    fn render(&self, size: Size, _cfg: &(), ctx: &RenderCtx) -> Rendered {
+    fn render(&self, size: Size, cfg: &ChipsConfig, ctx: &RenderCtx) -> Rendered {
         if size == Size::Xs {
             return Rendered::empty();
         }
         if !chip_should_render(ctx.other, &ctx.git.pr.url) {
             return Rendered::empty();
         }
+
+        let stack = stack_ordered_urls(ctx.other, cfg.force_stack);
+
         match size {
             Size::S | Size::M => {
+                // Compact: still ×N count even in stack mode (Xs already
+                // dropped earlier; Sm+ shows the chain, but only at L+ here
+                // because the fixed sizes() list is Xs/S/M/Xl).
                 let n = ctx.other.urls.len();
                 Rendered::from_text(format!("{DIM}{PR_OPEN}×{n}{RESET}"))
             }
-            _ => {
-                let mut parts = String::new();
-                for u in &ctx.other.urls {
-                    let n = u.rsplit('/').next().unwrap_or("");
-                    let c = pr_color_for(ctx.other, u);
-                    parts.push(' ');
-                    parts.push_str(&link(u, &format!("{c}#{n}{RESET}")));
+            _ => match stack {
+                Some(urls) if !urls.is_empty() => {
+                    let sep = format!("{DIM}{}{RESET}", cfg.stack_separator);
+                    let glyph = if cfg.stack_glyph.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{DIM}{FG_CYAN}{}{RESET} ", cfg.stack_glyph)
+                    };
+                    let chips: Vec<String> =
+                        urls.iter().map(|u| render_chip(ctx.other, u)).collect();
+                    Rendered::from_text(format!("{glyph}{}", chips.join(&sep)))
                 }
-                Rendered::from_text(format!("{DIM}{PR_OPEN}{RESET}{parts}"))
-            }
+                _ => {
+                    // Legacy path: leading PR_OPEN icon, space-separated chips
+                    // in their original (transcript-discovered) order.
+                    let mut parts = String::new();
+                    for u in &ctx.other.urls {
+                        parts.push(' ');
+                        parts.push_str(&render_chip(ctx.other, u));
+                    }
+                    Rendered::from_text(format!("{DIM}{PR_OPEN}{RESET}{parts}"))
+                }
+            },
         }
     }
 }
@@ -813,7 +932,7 @@ pub fn render_named(name: &str, size: Size, ctx: &RenderCtx) -> Option<Rendered>
         "ahead" => Ahead.render(size, &(), ctx),
         "behind" => Behind.render(size, &(), ctx),
         "ticket" => Ticket.render(size, &(), ctx),
-        "chips" => Chips.render(size, &(), ctx),
+        "chips" => Chips.render(size, &cfg.chips, ctx),
         "burn" => Burn.render(size, &(), ctx),
         "agents" => Agents.render(size, &(), ctx),
         "quotas" => Quotas.render(size, &(), ctx),
@@ -981,5 +1100,163 @@ mod tests {
         let xs = bar.render(Size::Xs, &cfg, &ctx).width;
         let xl = bar.render(Size::Xl, &cfg, &ctx).width;
         assert!(xl > xs);
+    }
+
+    fn url(n: u32) -> String {
+        format!("https://github.com/foo/bar/pull/{n}")
+    }
+
+    fn entry(branch: &str, pr: Option<u32>, depth: u32) -> crate::transcript::StackChipEntry {
+        crate::transcript::StackChipEntry {
+            branch: branch.into(),
+            pr,
+            depth,
+        }
+    }
+
+    fn stack_other(urls: Vec<u32>, entries: Vec<crate::transcript::StackChipEntry>) -> OtherPrs {
+        OtherPrs {
+            urls: urls.into_iter().map(url).collect(),
+            states: Default::default(),
+            is_gt: true,
+            stack_entries: entries,
+        }
+    }
+
+    #[test]
+    fn chips_stack_orders_by_depth() {
+        // Stack: trunk(main, depth 0, no PR) → feat/a(#101, depth 1)
+        //                                    → feat/b(#102, depth 2)
+        //                                    → feat/c(#103, depth 3)
+        // Discovered URLs are scrambled (#103, #101, #102) — output must be
+        // trunk-first depth ordering.
+        let other = stack_other(
+            vec![103, 101, 102],
+            vec![
+                entry("main", None, 0),
+                entry("feat/a", Some(101), 1),
+                entry("feat/b", Some(102), 2),
+                entry("feat/c", Some(103), 3),
+            ],
+        );
+        let cfg = ChipsConfig::default();
+        let ordered = stack_ordered_urls(&other, cfg.force_stack).expect("stack mode active");
+        assert_eq!(
+            ordered,
+            vec![url(101), url(102), url(103)],
+            "depth-ordered chip URLs"
+        );
+    }
+
+    #[test]
+    fn chips_uncovered_prs_appended_after_stack() {
+        // #999 is not in the stack — must come after all stacked chips,
+        // sorted ascending among the uncovered set.
+        let other = stack_other(
+            vec![102, 999, 101],
+            vec![entry("feat/a", Some(101), 1), entry("feat/b", Some(102), 2)],
+        );
+        let cfg = ChipsConfig::default();
+        let ordered = stack_ordered_urls(&other, cfg.force_stack).expect("stack active");
+        assert_eq!(ordered, vec![url(101), url(102), url(999)]);
+    }
+
+    #[test]
+    fn chips_fallback_when_not_gt() {
+        // is_gt=false, force_stack=false ⇒ no stack ordering.
+        let mut other = stack_other(
+            vec![102, 101],
+            vec![entry("feat/a", Some(101), 1), entry("feat/b", Some(102), 2)],
+        );
+        other.is_gt = false;
+        let cfg = ChipsConfig::default();
+        assert!(stack_ordered_urls(&other, cfg.force_stack).is_none());
+    }
+
+    #[test]
+    fn chips_requires_two_covered_for_stack_mode() {
+        // Only #101 maps into the stack; #999 doesn't. With one covered chip
+        // the stack ordering is no improvement over legacy → fall back.
+        let other = stack_other(vec![999, 101], vec![entry("feat/a", Some(101), 1)]);
+        let cfg = ChipsConfig::default();
+        assert!(stack_ordered_urls(&other, cfg.force_stack).is_none());
+    }
+
+    #[test]
+    fn chips_force_stack_engages_with_one_covered() {
+        // force_stack overrides the ≥2 covered rule.
+        let other = stack_other(vec![999, 101], vec![entry("feat/a", Some(101), 1)]);
+        let ordered = stack_ordered_urls(&other, true).expect("forced");
+        assert_eq!(ordered, vec![url(101), url(999)]);
+    }
+
+    #[test]
+    fn chips_xs_collapses_to_count() {
+        // Xs path returns empty (component is dropped); the ×N collapse lives
+        // at S/M.
+        let (session, git, other_def, burn, agents) = mkctx();
+        let other = stack_other(
+            vec![101, 102, 103],
+            vec![
+                entry("feat/a", Some(101), 1),
+                entry("feat/b", Some(102), 2),
+                entry("feat/c", Some(103), 3),
+            ],
+        );
+        let _ = other_def; // unused; replaced
+        let ctx = RenderCtx {
+            session: &session,
+            git: &git,
+            other: &other,
+            burn: &burn,
+            agents: &agents,
+            tick: 0,
+        };
+        let cfg = ChipsConfig::default();
+        let xs = Chips.render(Size::Xs, &cfg, &ctx);
+        assert!(xs.text.is_empty(), "Xs drops chips entirely");
+
+        let m = Chips.render(Size::M, &cfg, &ctx);
+        assert!(m.text.contains("×3"), "M collapses to ×N count: {}", m.text);
+
+        let xl = Chips.render(Size::Xl, &cfg, &ctx);
+        assert!(xl.text.contains("#101"), "Xl shows full chain: {}", xl.text);
+        assert!(xl.text.contains("#103"));
+        // Stack separator present and trunk-first ordering: #101 appears
+        // before #103 in the rendered string.
+        let p101 = xl.text.find("#101").unwrap();
+        let p103 = xl.text.find("#103").unwrap();
+        assert!(p101 < p103, "trunk-first order");
+        assert!(
+            xl.text.contains(&cfg.stack_separator),
+            "uses configured stack separator"
+        );
+    }
+
+    #[test]
+    fn chips_legacy_render_when_no_stack() {
+        // Without is_gt and without force_stack, the legacy leading PR_OPEN
+        // glyph is rendered and no stack separator appears.
+        let (session, git, _other_def, burn, agents) = mkctx();
+        let other = OtherPrs {
+            urls: vec![url(101), url(102)],
+            ..Default::default()
+        };
+        let ctx = RenderCtx {
+            session: &session,
+            git: &git,
+            other: &other,
+            burn: &burn,
+            agents: &agents,
+            tick: 0,
+        };
+        let cfg = ChipsConfig::default();
+        let r = Chips.render(Size::Xl, &cfg, &ctx);
+        assert!(r.text.contains("#101"));
+        assert!(r.text.contains("#102"));
+        assert!(
+            !r.text.contains(&cfg.stack_separator),
+            "no stack separator in legacy mode"
+        );
     }
 }
