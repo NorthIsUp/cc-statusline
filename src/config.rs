@@ -3,11 +3,12 @@
 
 use crate::component::ComponentConfig;
 use crate::components::{BurnConfig, ChipsConfig, CtxBarConfig, QuotasConfig};
+use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct LayoutConfig {
     pub left: Vec<String>,
@@ -54,7 +55,7 @@ pub fn default_right() -> Vec<String> {
     .collect()
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct Config {
     pub linear_workspace: Option<String>,

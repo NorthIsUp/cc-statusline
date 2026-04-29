@@ -1,0 +1,665 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Config",
+  "type": "object",
+  "properties": {
+    "agents": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ComponentConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "ahead": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ComponentConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "behind": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ComponentConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "branch": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ComponentConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "burn": {
+      "$ref": "#/definitions/BurnConfig"
+    },
+    "chips": {
+      "$ref": "#/definitions/ChipsConfig"
+    },
+    "ci": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ComponentConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "comments": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ComponentConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "ctx_bar": {
+      "$ref": "#/definitions/CtxBarConfig"
+    },
+    "debug_focus_log": {
+      "default": null,
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "dirty": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ComponentConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "effort": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ComponentConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "layout": {
+      "description": "`[layout]` block — left/right component lists, gap, autoresize, etc.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/LayoutConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "linear_workspace": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "loc": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ComponentConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "model": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ComponentConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "nerd_font_width": {
+      "default": null,
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "other_cache_ttl": {
+      "default": null,
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "pr_cache_ttl": {
+      "default": null,
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "pr_expand_min_cols": {
+      "default": null,
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "pr_icon": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ComponentConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "pr_num": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ComponentConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "quotas": {
+      "$ref": "#/definitions/QuotasConfig"
+    },
+    "recent_prs_ttl": {
+      "default": null,
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "repo": {
+      "description": "Per-component common config blocks. Each component's `[name]` block is parsed into a `ComponentConfig` (priority/min/sizes/required) plus component-specific extension fields handled separately.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ComponentConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "review": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ComponentConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "safety_margin": {
+      "default": null,
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "spinner": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "spinner_cfg": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ComponentConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "ticket": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ComponentConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "BurnConfig": {
+      "description": "Per-component config for `burn`. Inherits the shared `[pct]` knobs (`mode`, `width`, `filled`, `empty`) plus the burn-specific `max_tokens_per_hour` ceiling used to derive a percent. Default mode is `percent`, which preserves the legacy `Σ <human>/hr` text rendering. The visual modes (`dots`, `shaded`, `hbar`, `vbar`) replace the text with a bar; `float` also keeps the legacy text format.",
+      "type": "object",
+      "properties": {
+        "default": {
+          "description": "Override of the default size. None = component's `default_size()`.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Size"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "empty": {
+          "description": "Override for the empty-cell glyph in `hbar` mode. Defaults to a single space so the bar reads cleanly as \"filled to here, empty after\".",
+          "default": " ",
+          "type": "string"
+        },
+        "filled": {
+          "description": "Override for the full-cell glyph in `hbar` mode. Defaults to `█`.",
+          "default": "█",
+          "type": "string"
+        },
+        "max_tokens_per_hour": {
+          "description": "Tokens-per-hour value treated as 100%. Picked to map typical burn rates (1M–3M/hr) to the 20–60% range so the visual modes are meaningful without saturating to red.",
+          "default": 5000000,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "min": {
+          "description": "Don't shrink past this size. None = component's smallest.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Size"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mode": {
+          "$ref": "#/definitions/PctMode"
+        },
+        "priority": {
+          "description": "Higher = shrunk LAST when autoresizing. Default 5.",
+          "default": 5,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "required": {
+          "description": "If true, never drop entirely.",
+          "default": false,
+          "type": "boolean"
+        },
+        "sizes": {
+          "description": "Sizes the user has whitelisted. Empty = use the component's full set.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Size"
+          }
+        },
+        "width": {
+          "default": 10,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "ChipsConfig": {
+      "description": "`[chips]` config block. Common ComponentConfig fields (priority/min/sizes/ required/default) live alongside chips-specific stack-mode knobs.\n\nIn stack mode (Graphite detected and ≥2 chip PRs covered by the stack), chips are reordered by depth and joined with `stack_separator`, prefixed by `stack_glyph` in dim cyan. Set `force_stack=true` to use the stack layout even without `gt`; set `stack_glyph=\"\"` to suppress the leading glyph.",
+      "type": "object",
+      "properties": {
+        "default": {
+          "description": "Override of the default size. None = component's `default_size()`.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Size"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "force_stack": {
+          "default": false,
+          "type": "boolean"
+        },
+        "min": {
+          "description": "Don't shrink past this size. None = component's smallest.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Size"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "priority": {
+          "description": "Higher = shrunk LAST when autoresizing. Default 5.",
+          "default": 5,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "required": {
+          "description": "If true, never drop entirely.",
+          "default": false,
+          "type": "boolean"
+        },
+        "sizes": {
+          "description": "Sizes the user has whitelisted. Empty = use the component's full set.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Size"
+          }
+        },
+        "stack_glyph": {
+          "default": "",
+          "type": "string"
+        },
+        "stack_refresh_ttl": {
+          "default": 60,
+          "type": "integer",
+          "format": "int64"
+        },
+        "stack_separator": {
+          "default": "─•─",
+          "type": "string"
+        }
+      }
+    },
+    "ComponentConfig": {
+      "description": "Common per-component config. Lives at the top of every `[name]` block.",
+      "type": "object",
+      "properties": {
+        "default": {
+          "description": "Override of the default size. None = component's `default_size()`.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Size"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "min": {
+          "description": "Don't shrink past this size. None = component's smallest.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Size"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "priority": {
+          "description": "Higher = shrunk LAST when autoresizing. Default 5.",
+          "default": 5,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "required": {
+          "description": "If true, never drop entirely.",
+          "default": false,
+          "type": "boolean"
+        },
+        "sizes": {
+          "description": "Sizes the user has whitelisted. Empty = use the component's full set.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Size"
+          }
+        }
+      }
+    },
+    "CtxBarConfig": {
+      "description": "Per-component config for `ctx_bar`. Inherits the shared `[pct]` knobs (`mode`, `width`, `filled`, `empty`) via `serde(flatten)` — meaning the existing `[ctx_bar]` blocks with `width = 10`, `filled = \"▓\"`, `empty = \"░\"` continue to parse unchanged. They're treated as overrides for the `hbar` mode glyphs.\n\nDefault mode is `percent` (a plain `47%`); set `mode = \"hbar\"` to bring back the bar look (now with sub-cell precision via the eighths glyphs).",
+      "type": "object",
+      "properties": {
+        "default": {
+          "description": "Override of the default size. None = component's `default_size()`.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Size"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "empty": {
+          "description": "Override for the empty-cell glyph in `hbar` mode. Defaults to a single space so the bar reads cleanly as \"filled to here, empty after\".",
+          "default": " ",
+          "type": "string"
+        },
+        "filled": {
+          "description": "Override for the full-cell glyph in `hbar` mode. Defaults to `█`.",
+          "default": "█",
+          "type": "string"
+        },
+        "min": {
+          "description": "Don't shrink past this size. None = component's smallest.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Size"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mode": {
+          "$ref": "#/definitions/PctMode"
+        },
+        "priority": {
+          "description": "Higher = shrunk LAST when autoresizing. Default 5.",
+          "default": 5,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "required": {
+          "description": "If true, never drop entirely.",
+          "default": false,
+          "type": "boolean"
+        },
+        "sizes": {
+          "description": "Sizes the user has whitelisted. Empty = use the component's full set.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Size"
+          }
+        },
+        "width": {
+          "default": 10,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "LayoutConfig": {
+      "type": "object",
+      "properties": {
+        "autoresize": {
+          "default": true,
+          "type": "boolean"
+        },
+        "gap": {
+          "default": 2,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "hysteresis_band": {
+          "default": 2,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "left": {
+          "default": [
+            "repo",
+            "pr_icon",
+            "branch",
+            "pr_num",
+            "ci",
+            "review",
+            "comments",
+            "dirty",
+            "ahead",
+            "behind",
+            "ticket",
+            "chips"
+          ],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "overflow_chips_to_second_row": {
+          "description": "When `chips` collapses to its compact `×N` form, render the expanded `#a #b #c …` chain on a second row instead of dropping it.",
+          "default": true,
+          "type": "boolean"
+        },
+        "right": {
+          "default": [
+            "burn",
+            "agents",
+            "quotas",
+            "ctx_bar",
+            "loc",
+            "model",
+            "effort",
+            "spinner"
+          ],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "PctMode": {
+      "type": "string",
+      "enum": [
+        "percent",
+        "float",
+        "dots",
+        "shaded",
+        "hbar",
+        "vbar"
+      ]
+    },
+    "QuotasConfig": {
+      "description": "Per-component config for `quotas`. Inherits the shared `[pct]` knobs (`mode`, `width`, `filled`, `empty`). Default mode is `percent` to preserve the legacy `<glyph> 47%` text. The reset-time suffix is appended by `quota::fmt_quota` regardless of mode, so users can switch the percent visual to `dots`/`hbar` without losing the reset clock.",
+      "type": "object",
+      "properties": {
+        "default": {
+          "description": "Override of the default size. None = component's `default_size()`.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Size"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "empty": {
+          "description": "Override for the empty-cell glyph in `hbar` mode. Defaults to a single space so the bar reads cleanly as \"filled to here, empty after\".",
+          "default": " ",
+          "type": "string"
+        },
+        "filled": {
+          "description": "Override for the full-cell glyph in `hbar` mode. Defaults to `█`.",
+          "default": "█",
+          "type": "string"
+        },
+        "min": {
+          "description": "Don't shrink past this size. None = component's smallest.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Size"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mode": {
+          "$ref": "#/definitions/PctMode"
+        },
+        "priority": {
+          "description": "Higher = shrunk LAST when autoresizing. Default 5.",
+          "default": 5,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "required": {
+          "description": "If true, never drop entirely.",
+          "default": false,
+          "type": "boolean"
+        },
+        "sizes": {
+          "description": "Sizes the user has whitelisted. Empty = use the component's full set.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Size"
+          }
+        },
+        "width": {
+          "default": 10,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Size": {
+      "description": "Discrete size buckets a component can render at, smallest → largest.",
+      "type": "string",
+      "enum": [
+        "xs",
+        "s",
+        "m",
+        "l",
+        "xl"
+      ]
+    }
+  }
+}

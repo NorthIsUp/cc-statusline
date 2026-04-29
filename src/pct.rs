@@ -16,10 +16,12 @@
 //   vbar      1 cell, 8 vertical levels:   ▁▂▃▄▅▆▇█
 
 use crate::glyphs::{DIM, FG_RED, FG_YELLOW, RESET};
+use schemars::JsonSchema;
 use serde::Deserialize;
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
+#[schemars(rename_all = "lowercase")]
 pub enum PctMode {
     #[default]
     Percent,
@@ -30,7 +32,7 @@ pub enum PctMode {
     Vbar,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct PctConfig {
     pub mode: PctMode,
