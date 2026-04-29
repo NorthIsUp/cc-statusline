@@ -1,3 +1,4 @@
+#:schema https://raw.githubusercontent.com/NorthIsUp/cc-statusline/main/config.schema.json
 # Example: $XDG_CONFIG_HOME/cc-statusbar/config.toml
 # Every field is optional; defaults match the bash original.
 # Env vars (LINEAR_WORKSPACE, CC_STATUSLINE_*) take precedence over file values.

@@ -9,6 +9,7 @@ use crate::git::CiState;
 use crate::glyphs::*;
 use crate::pct::{self, PctConfig, PctMode};
 use crate::quota::{self, WIN_5H, WIN_7D};
+use schemars::JsonSchema;
 use serde::Deserialize;
 
 // ─── helpers ────────────────────────────────────────────────────────────
@@ -405,7 +406,7 @@ impl Component for Ticket {
 /// by `stack_glyph` in dim cyan. Set `force_stack=true` to use the stack
 /// layout even without `gt`; set `stack_glyph=""` to suppress the leading
 /// glyph.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct ChipsConfig {
     pub stack_separator: String,
@@ -591,7 +592,7 @@ fn human_burn(n: u64) -> String {
 /// preserves the legacy `Σ <human>/hr` text rendering. The visual modes
 /// (`dots`, `shaded`, `hbar`, `vbar`) replace the text with a bar; `float`
 /// also keeps the legacy text format.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct BurnConfig {
     /// Tokens-per-hour value treated as 100%. Picked to map typical burn
@@ -694,7 +695,7 @@ impl Component for Agents {
 /// preserve the legacy `<glyph> 47%` text. The reset-time suffix is appended
 /// by `quota::fmt_quota` regardless of mode, so users can switch the percent
 /// visual to `dots`/`hbar` without losing the reset clock.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct QuotasConfig {
     #[serde(flatten)]
@@ -746,7 +747,7 @@ impl Component for Quotas {
 ///
 /// Default mode is `percent` (a plain `47%`); set `mode = "hbar"` to bring
 /// back the bar look (now with sub-cell precision via the eighths glyphs).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct CtxBarConfig {
     #[serde(flatten)]

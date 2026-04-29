@@ -110,6 +110,28 @@ Hysteresis: once a component is shrunk at terminal width W, it stays
 shrunk while cols stays within ±`hysteresis_band` of W. Decisions
 persist in `state.toml` so the line doesn't oscillate as you nudge-resize.
 
+## Editor support
+
+A JSON schema for `config.toml` lives at the repo root as
+`config.schema.json`. Point editors at it for autocomplete and validation.
+
+With the [Even Better TOML](https://marketplace.visualstudio.com/items?itemName=tamasfe.even-better-toml)
+VS Code extension, add a `#:schema` directive to the top of your
+`config.toml`:
+
+```toml
+#:schema https://raw.githubusercontent.com/NorthIsUp/cc-statusline/main/config.schema.json
+```
+
+To regenerate the schema after changing config structs:
+
+```sh
+cargo run --bin gen_schema > config.schema.json
+```
+
+CI diffs the committed schema against `gen_schema` output, so any
+struct change must come with a regenerated `config.schema.json`.
+
 ## Releasing
 
 1. Add a `## [X.Y.Z] - YYYY-MM-DD` section to `CHANGELOG.md`.

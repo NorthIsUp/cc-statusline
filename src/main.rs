@@ -27,24 +27,7 @@
     clippy::manual_range_contains
 )]
 
-mod cache;
-mod component;
-mod components;
-mod config;
-mod focus;
-mod git;
-mod glyphs;
-mod input;
-mod layout;
-mod pct;
-mod quota;
-mod recent_prs;
-mod refresh;
-mod render;
-mod state;
-mod transcript;
-mod vlen;
-
+use cc_statusline::{focus, git, input, recent_prs, refresh, render, state, transcript};
 use std::io::{self, Read};
 
 fn main() {

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-04-29
+
+### Added
+
+- JSON schema for `config.toml`, generated from the config structs via
+  `schemars`. New `gen_schema` binary emits `config.schema.json` to stdout;
+  the committed schema lives at the repo root and is checked in CI for
+  drift. `config.example.toml` ships with a `#:schema` directive so editors
+  with the Even Better TOML extension light up autocomplete and validation
+  out of the box. (Closes #13)
+
+### Changed
+
+- The crate now exposes a library target (`cc_statusline`) alongside the
+  existing `cc-statusline` binary so external binaries (currently
+  `gen_schema`) can reach the config types. Installs are unchanged —
+  `cargo install --path .` still produces `cc-statusline`.
+
 ## [0.1.6] - 2026-04-29
 
 ### Added

@@ -16,3 +16,7 @@ jobs:
       - run: cargo test
       - run: cargo clippy -- -D warnings
       - run: cargo fmt --check
+      - name: schema up-to-date
+        run: |
+          cargo run --bin gen_schema > /tmp/schema.json
+          diff -u config.schema.json /tmp/schema.json

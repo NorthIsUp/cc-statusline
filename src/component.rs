@@ -11,11 +11,13 @@
 use crate::git::GitData;
 use crate::input::Session;
 use crate::transcript::{AgentCount, BurnInfo, OtherPrs};
+use schemars::JsonSchema;
 use serde::Deserialize;
 use std::str::FromStr;
 
 /// Discrete size buckets a component can render at, smallest → largest.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, JsonSchema)]
+#[schemars(rename_all = "lowercase")]
 pub enum Size {
     Xs,
     S,
@@ -97,7 +99,7 @@ pub struct RenderCtx<'a> {
 }
 
 /// Common per-component config. Lives at the top of every `[name]` block.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct ComponentConfig {
     /// Sizes the user has whitelisted. Empty = use the component's full set.
