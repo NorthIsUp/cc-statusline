@@ -1,9 +1,54 @@
 // Global config: $XDG_CONFIG_HOME/cc-statusbar/config.toml.
 // Falls back to ~/.config/cc-statusbar/config.toml. Env vars override file.
 
+use crate::component::ComponentConfig;
+use crate::components::CtxBarConfig;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct LayoutConfig {
+    pub left: Vec<String>,
+    pub right: Vec<String>,
+    pub gap: u32,
+    pub autoresize: bool,
+    pub hysteresis_band: u32,
+}
+
+impl Default for LayoutConfig {
+    fn default() -> Self {
+        Self {
+            left: default_left(),
+            right: default_right(),
+            gap: 2,
+            autoresize: true,
+            hysteresis_band: 2,
+        }
+    }
+}
+
+/// Default left pane order — reproduces the legacy hardcoded layout.
+pub fn default_left() -> Vec<String> {
+    [
+        "repo", "pr_icon", "branch", "pr_num", "ci", "review", "comments", "dirty", "ahead",
+        "behind", "ticket", "chips",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Default right pane order.
+pub fn default_right() -> Vec<String> {
+    [
+        "burn", "agents", "quotas", "ctx_bar", "loc", "model", "effort", "spinner",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
 
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
@@ -17,15 +62,54 @@ pub struct Config {
     pub debug_focus_log: Option<bool>,
     pub spinner: Option<String>,
     pub recent_prs_ttl: Option<i64>,
-    /// Layout template for the left pane. When unset, the built-in hardcoded
-    /// layout is used (existing behaviour). Syntax: `${name}` or `${name:variant}`.
-    pub left: Option<String>,
-    /// Layout template for the right pane. See `left`.
-    pub right: Option<String>,
-    /// When the rendered single line's visible width exceeds this threshold,
-    /// the right pane is pushed to a second line, right-aligned to `cols`.
-    /// Only applies when at least one of `left`/`right` is set.
-    pub soft_wrap_cols: Option<u32>,
+
+    /// `[layout]` block — left/right component lists, gap, autoresize, etc.
+    #[serde(default)]
+    pub layout: Option<LayoutConfig>,
+
+    /// Per-component common config blocks. Each component's `[name]` block
+    /// is parsed into a `ComponentConfig` (priority/min/sizes/required) plus
+    /// component-specific extension fields handled separately.
+    #[serde(default)]
+    pub repo: Option<ComponentConfig>,
+    #[serde(default)]
+    pub branch: Option<ComponentConfig>,
+    #[serde(default)]
+    pub pr_icon: Option<ComponentConfig>,
+    #[serde(default)]
+    pub pr_num: Option<ComponentConfig>,
+    #[serde(default)]
+    pub ci: Option<ComponentConfig>,
+    #[serde(default)]
+    pub review: Option<ComponentConfig>,
+    #[serde(default)]
+    pub comments: Option<ComponentConfig>,
+    #[serde(default)]
+    pub dirty: Option<ComponentConfig>,
+    #[serde(default)]
+    pub ahead: Option<ComponentConfig>,
+    #[serde(default)]
+    pub behind: Option<ComponentConfig>,
+    #[serde(default)]
+    pub ticket: Option<ComponentConfig>,
+    #[serde(default)]
+    pub chips: Option<ComponentConfig>,
+    #[serde(default)]
+    pub burn: Option<ComponentConfig>,
+    #[serde(default)]
+    pub agents: Option<ComponentConfig>,
+    #[serde(default)]
+    pub quotas: Option<ComponentConfig>,
+    #[serde(default)]
+    pub ctx_bar: CtxBarConfig,
+    #[serde(default)]
+    pub loc: Option<ComponentConfig>,
+    #[serde(default)]
+    pub model: Option<ComponentConfig>,
+    #[serde(default)]
+    pub effort: Option<ComponentConfig>,
+    #[serde(default)]
+    pub spinner_cfg: Option<ComponentConfig>,
 }
 
 impl Config {
@@ -57,19 +141,11 @@ impl Config {
             .unwrap_or(160)
     }
     pub fn pr_cache_ttl(&self) -> i64 {
-        // Was 10s. With 1Hz statusline + multiple sessions, that pace burns
-        // through the 5000/hr GitHub API budget fast. 60s is still snappy
-        // enough to see PR/CI changes within a minute.
         self.pr_cache_ttl.unwrap_or(60)
     }
     pub fn other_cache_ttl(&self) -> i64 {
-        // 10 min. Other-PR chips are background context; refreshing every 2
-        // min when there are many sessions × many chips × ~1 gh call each was
-        // a primary source of the rate-limit hit.
         self.other_cache_ttl.unwrap_or(600)
     }
-    /// TTL for the global "recent PRs by viewer" cache. One GraphQL call
-    /// every `recent_prs_ttl` seconds, shared across all sessions.
     pub fn recent_prs_ttl(&self) -> i64 {
         self.recent_prs_ttl.unwrap_or(20)
     }
@@ -79,14 +155,37 @@ impl Config {
     pub fn spinner(&self) -> String {
         self.spinner.clone().unwrap_or_else(|| "compact".into())
     }
-    pub fn left_template(&self) -> Option<&str> {
-        self.left.as_deref()
+    pub fn layout(&self) -> LayoutConfig {
+        self.layout.clone().unwrap_or_default()
     }
-    pub fn right_template(&self) -> Option<&str> {
-        self.right.as_deref()
-    }
-    pub fn soft_wrap_cols(&self) -> u32 {
-        self.soft_wrap_cols.unwrap_or(160)
+
+    /// Per-component common config. Returns the user-configured block or a
+    /// default if absent.
+    pub fn component_config(&self, name: &str) -> ComponentConfig {
+        let pick = |o: &Option<ComponentConfig>| o.clone().unwrap_or_default();
+        match name {
+            "repo" => pick(&self.repo),
+            "branch" => pick(&self.branch),
+            "pr_icon" => pick(&self.pr_icon),
+            "pr_num" => pick(&self.pr_num),
+            "ci" => pick(&self.ci),
+            "review" => pick(&self.review),
+            "comments" => pick(&self.comments),
+            "dirty" => pick(&self.dirty),
+            "ahead" => pick(&self.ahead),
+            "behind" => pick(&self.behind),
+            "ticket" => pick(&self.ticket),
+            "chips" => pick(&self.chips),
+            "burn" => pick(&self.burn),
+            "agents" => pick(&self.agents),
+            "quotas" => pick(&self.quotas),
+            "ctx_bar" => self.ctx_bar.common.clone(),
+            "loc" => pick(&self.loc),
+            "model" => pick(&self.model),
+            "effort" => pick(&self.effort),
+            "spinner" => pick(&self.spinner_cfg),
+            _ => ComponentConfig::default(),
+        }
     }
 }
 
@@ -116,9 +215,6 @@ pub fn state_path(session_id: &str) -> PathBuf {
     cache_dir().join(format!("{session_id}.toml"))
 }
 
-/// Shared, cross-session cache of recent PRs authored by the viewer. One
-/// `gh api graphql` call hydrates state for every chip across every session,
-/// instead of N per-URL lookups per session.
 pub fn recent_prs_path() -> PathBuf {
     cache_dir().join("recent_prs.toml")
 }

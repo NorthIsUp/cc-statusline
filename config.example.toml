@@ -11,9 +11,6 @@ safety_margin = 6
 # Cell width for Nerd Font PUA glyphs (1 = single, 2 = double).
 nerd_font_width = 1
 
-# Minimum cols at which the "other PRs" chip expands from "×N" to "#N1 #N2 …".
-pr_expand_min_cols = 160
-
 # Seconds. How long the current-branch PR cache is fresh.
 pr_cache_ttl = 10
 
@@ -26,14 +23,70 @@ debug_focus_log = true
 # Trailing spinner style.
 #   "compact"  – single braille frame, advanced one frame per render
 #   "epoch-N"  – last N digits of the wall-clock epoch (e.g. "epoch-3" → "535")
-#                The 1's digit changes every second, guaranteeing visible motion.
 spinner = "compact"
 
-# Layout templates (Starship-style). Uncomment to customise segment order /
-# content. Empty variables collapse adjacent literal whitespace.
-# left  = "${repo} ${branch}${pr_num} ${ci}${review}${comments} ${dirty}${ahead}${behind} ${ticket}"
-# right = "${burn} · ${agents} · ${quotas} ${ctx} ${loc} [${model:long} · ${effort:icon}${effort:short}] ${spinner}"
+# ─── Layout ────────────────────────────────────────────────────────────────
+#
+# The layout engine renders every component at its default size and shrinks
+# lowest-priority components first when the line is too wide. Hysteresis
+# (`hysteresis_band`) keeps decisions sticky across small terminal nudges.
 
-# When the rendered single line exceeds this width, the right pane is
-# pushed to a second line, right-aligned to the terminal width.
-# soft_wrap_cols = 160
+[layout]
+left = [
+  "repo",
+  "pr_icon",
+  "branch",
+  "pr_num",
+  "ci",
+  "review",
+  "comments",
+  "dirty",
+  "ahead",
+  "behind",
+  "ticket",
+  "chips",
+]
+right = [
+  "burn",
+  "agents",
+  "quotas",
+  "ctx_bar",
+  "loc",
+  "model",
+  "effort",
+  "spinner",
+]
+gap = 2
+autoresize = true
+hysteresis_band = 2
+
+# ─── Per-component config ──────────────────────────────────────────────────
+#
+# Common fields (every block accepts these):
+#   sizes    = list of allowed size buckets, e.g. ["m", "l", "xl"]
+#   min      = "m"        # don't shrink past this size
+#   default  = "xl"       # initial size before autoresize
+#   priority = 9          # higher = shrunk LAST
+#   required = true       # never drop entirely
+#
+# Component-specific fields are documented per block below.
+
+[ctx_bar]
+priority = 90
+default  = "m"
+width    = 10
+filled   = "▓"
+empty    = "░"
+
+[chips]
+priority = 5
+
+[model]
+priority = 80
+
+[burn]
+priority = 8
+
+[spinner]
+priority = 100
+required = true
