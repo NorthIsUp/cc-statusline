@@ -1,0 +1,30 @@
+# Example: $XDG_CONFIG_HOME/cc-statusbar/config.toml
+# Every field is optional; defaults match the bash original.
+# Env vars (LINEAR_WORKSPACE, CC_STATUSLINE_*) take precedence over file values.
+
+# Linear workspace prefix used in [TICKET] hyperlinks.
+linear_workspace = "teamclara"
+
+# Cells subtracted from terminal width to absorb Nerd Font glyph variance.
+safety_margin = 6
+
+# Cell width for Nerd Font PUA glyphs (1 = single, 2 = double).
+nerd_font_width = 1
+
+# Minimum cols at which the "other PRs" chip expands from "×N" to "#N1 #N2 …".
+pr_expand_min_cols = 160
+
+# Seconds. How long the current-branch PR cache is fresh.
+pr_cache_ttl = 10
+
+# Seconds. How long the "other PRs" cache + their states are fresh.
+other_cache_ttl = 120
+
+# Append focus diagnostics to /tmp/cc-focus-<session_id>.log every render.
+debug_focus_log = true
+
+# Trailing spinner style.
+#   "compact"  – single braille frame, advanced one frame per render
+#   "epoch-N"  – last N digits of the wall-clock epoch (e.g. "epoch-3" → "535")
+#                The 1's digit changes every second, guaranteeing visible motion.
+spinner = "compact"
