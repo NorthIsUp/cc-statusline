@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   threshold. Default behaviour unchanged when `left`/`right` are unset.
   (#1)
 
+## [0.1.3] - 2026-04-28
+
+### Added
+
+- Auto-clear per-session and shared recent_prs caches when the binary version
+  changes. Free schema migration on every Cargo.toml bump.
+
 ## [0.1.2] - 2026-04-28
 
 ### Changed

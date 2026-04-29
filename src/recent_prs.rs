@@ -19,6 +19,9 @@ use std::process::{Command, Stdio};
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RecentPrs {
+    /// Set to `crate::state::STATE_VERSION` on save; mismatched on load
+    /// triggers a full reset (same migration story as per-session state).
+    pub version: String,
     pub fetched_at: i64,
     pub locked_at: i64,
     /// Map url -> {state, isDraft}. Stored as serde_json::Value-ish so we
@@ -39,12 +42,17 @@ impl RecentPrs {
         config::recent_prs_path()
     }
     pub fn load() -> Self {
-        std::fs::read_to_string(Self::path())
+        let parsed: Self = std::fs::read_to_string(Self::path())
             .ok()
             .and_then(|t| toml::from_str(&t).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if parsed.version != crate::state::STATE_VERSION {
+            return Self::default();
+        }
+        parsed
     }
-    pub fn save(&self) -> io::Result<()> {
+    pub fn save(&mut self) -> io::Result<()> {
+        self.version = crate::state::STATE_VERSION.into();
         let path = Self::path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -112,7 +120,8 @@ pub fn run_refresh() {
     let _ = cur.save();
 
     if let Some(prs) = fetch() {
-        let new = RecentPrs {
+        let mut new = RecentPrs {
+            version: crate::state::STATE_VERSION.into(),
             fetched_at: now_epoch(),
             locked_at: 0,
             prs,

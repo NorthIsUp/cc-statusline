@@ -16,9 +16,16 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
+/// Binary version this state was last written by. If the on-disk version
+/// doesn't match the running binary's `CARGO_PKG_VERSION`, the state is
+/// discarded and rebuilt — gives us free schema migration on version bumps.
+pub const STATE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct State {
+    /// Set to `STATE_VERSION` on save; checked on load.
+    pub version: String,
     pub focus: FocusState,
     pub pr: PrCache,
     pub other_prs: OtherPrCache,
@@ -127,7 +134,8 @@ impl StateLock {
         }
     }
 
-    pub fn save(&self) -> io::Result<()> {
+    pub fn save(&mut self) -> io::Result<()> {
+        self.state.version = STATE_VERSION.into();
         let body = toml::to_string(&self.state).map_err(|e| io::Error::other(e.to_string()))?;
         let tmp = self.path.with_extension("toml.tmp");
         std::fs::write(&tmp, body)?;
@@ -148,7 +156,14 @@ fn read_state(path: &PathBuf) -> State {
     if f.read_to_string(&mut buf).is_err() {
         return State::default();
     }
-    toml::from_str(&buf).unwrap_or_default()
+    let parsed: State = toml::from_str(&buf).unwrap_or_default();
+    // Auto-clear cache if the binary version changed since we last wrote.
+    // Free schema migration — bumping Cargo.toml invalidates everyone's
+    // state without manual `rm` dance.
+    if parsed.version != STATE_VERSION {
+        return State::default();
+    }
+    parsed
 }
 
 impl State {
