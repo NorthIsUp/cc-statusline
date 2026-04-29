@@ -110,7 +110,26 @@ default  = "m"
 # Same `mode` options as ctx_bar. Reset-time suffix (e.g. "(2h30m)") is
 # appended regardless of mode, so switching to `dots`/`hbar` doesn't lose
 # the reset clock.
+#
+# Top-level keys here act as defaults for every bucket. Per-bucket
+# sub-sections override the parent defaults wholesale (the override sub-
+# section's `mode`/`width`/`filled`/`empty` replace the parent's, they
+# don't field-merge). Render order: hourly → weekly → design → sonnet;
+# empty buckets are skipped silently.
 # mode = "percent"
+
+# [quotas.hourly]    # 5-hour bucket (rate_limits.five_hour)
+# mode = "vbar"
+
+# [quotas.weekly]    # 7-day bucket (rate_limits.seven_day)
+# mode = "hbar"
+# width = 8
+
+# [quotas.design]    # design-partner / opus-design quota
+# mode = "dots"
+
+# [quotas.sonnet]    # sonnet model quota
+# mode = "shaded"
 
 [burn]
 priority = 8

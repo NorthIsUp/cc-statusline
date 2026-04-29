@@ -690,11 +690,15 @@ impl Component for Agents {
 
 // ─── quotas ─────────────────────────────────────────────────────────────
 
-/// Per-component config for `quotas`. Inherits the shared `[pct]` knobs
-/// (`mode`, `width`, `filled`, `empty`). Default mode is `percent` to
-/// preserve the legacy `<glyph> 47%` text. The reset-time suffix is appended
-/// by `quota::fmt_quota` regardless of mode, so users can switch the percent
-/// visual to `dots`/`hbar` without losing the reset clock.
+/// Per-component config for `quotas`. Top-level keys (`mode`, `width`,
+/// `filled`, `empty`) act as defaults applied to every bucket; per-bucket
+/// sub-sections (`[quotas.hourly]`, `[quotas.weekly]`, `[quotas.design]`,
+/// `[quotas.sonnet]`) override those defaults for that bucket only.
+///
+/// Default mode is `percent` to preserve the legacy `<glyph> 47%` text.
+/// The reset-time suffix is appended by `quota::fmt_quota` regardless of
+/// mode, so users can switch the percent visual to `dots`/`hbar` without
+/// losing the reset clock.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct QuotasConfig {
@@ -702,6 +706,35 @@ pub struct QuotasConfig {
     pub pct: PctConfig,
     #[serde(flatten)]
     pub common: crate::component::ComponentConfig,
+    /// Override for the 5-hour bucket (`rate_limits.five_hour`).
+    pub hourly: Option<PctConfig>,
+    /// Override for the 7-day bucket (`rate_limits.seven_day`).
+    pub weekly: Option<PctConfig>,
+    /// Override for the design-partner bucket.
+    pub design: Option<PctConfig>,
+    /// Override for the sonnet model bucket.
+    pub sonnet: Option<PctConfig>,
+}
+
+impl QuotasConfig {
+    /// Resolve a bucket override against the parent defaults. When the bucket
+    /// has its own `PctConfig`, it wins wholesale; otherwise the parent
+    /// `[quotas]` defaults are used. (We don't field-merge: `PctConfig` fields
+    /// are tightly coupled — `mode = "hbar"` only makes sense alongside its
+    /// own `width`/`filled`/`empty`.)
+    fn effective(&self, bucket: &Option<PctConfig>) -> PctConfig {
+        bucket.clone().unwrap_or_else(|| self.pct.clone())
+    }
+}
+
+/// One quota bucket's render inputs. Grouped to keep the buckets array
+/// readable (a flat tuple form trips clippy::type_complexity).
+struct Bucket<'a> {
+    label: &'a str,
+    pct: Option<u32>,
+    reset: Option<i64>,
+    window: i64,
+    cfg: &'a Option<PctConfig>,
 }
 
 pub struct Quotas;
@@ -718,17 +751,55 @@ impl Component for Quotas {
     }
     fn render(&self, _size: Size, cfg: &QuotasConfig, ctx: &RenderCtx) -> Rendered {
         let s = ctx.session;
-        let q5 = quota::fmt_quota(s.r5h, s.r5h_reset, WIN_5H, CLOCK_5H, &cfg.pct);
-        let q7 = quota::fmt_quota(s.r7d, s.r7d_reset, WIN_7D, CALENDAR_7D, &cfg.pct);
+        // Render order: hourly, weekly, design, sonnet. Skip empty buckets.
+        // Design/sonnet windows aren't documented upstream — use WIN_7D as a
+        // sane default so pace coloring degrades to the static threshold when
+        // `resets_at` is missing (which it currently always is).
+        let buckets = [
+            Bucket {
+                label: CLOCK_5H,
+                pct: s.r5h,
+                reset: s.r5h_reset,
+                window: WIN_5H,
+                cfg: &cfg.hourly,
+            },
+            Bucket {
+                label: CALENDAR_7D,
+                pct: s.r7d,
+                reset: s.r7d_reset,
+                window: WIN_7D,
+                cfg: &cfg.weekly,
+            },
+            // design/sonnet buckets: config plumbing exists, but the
+            // upstream session JSON paths aren't documented yet — pct stays
+            // None so these always render empty until follow-up work captures
+            // a real session payload and wires `Session::design`/`sonnet`.
+            Bucket {
+                label: DESIGN_Q,
+                pct: None,
+                reset: None,
+                window: WIN_7D,
+                cfg: &cfg.design,
+            },
+            Bucket {
+                label: SONNET_Q,
+                pct: None,
+                reset: None,
+                window: WIN_7D,
+                cfg: &cfg.sonnet,
+            },
+        ];
         let mut out = String::new();
-        if !q5.is_empty() {
-            out.push_str(&q5);
-        }
-        if !q7.is_empty() {
+        for b in buckets {
+            let pcfg = cfg.effective(b.cfg);
+            let q = quota::fmt_quota(b.pct, b.reset, b.window, b.label, &pcfg);
+            if q.is_empty() {
+                continue;
+            }
             if !out.is_empty() {
                 out.push_str(&format!(" {DIM}·{RESET} "));
             }
-            out.push_str(&q7);
+            out.push_str(&q);
         }
         if out.is_empty() {
             return Rendered::empty();
@@ -1229,6 +1300,147 @@ mod tests {
         assert!(
             r.text.contains("⡇"),
             "quotas dots@50%% should contain ⡇: {}",
+            r.text
+        );
+    }
+
+    #[test]
+    fn quotas_renders_only_hourly_weekly_when_design_sonnet_none() {
+        // Back-compat: with only the legacy r5h/r7d populated, the rendered
+        // string contains exactly the existing two glyphs and no design/sonnet
+        // glyphs, regardless of the new sub-section plumbing.
+        let (mut session, git, other, burn, agents) = mkctx();
+        session.r5h = Some(40);
+        session.r7d = Some(60);
+        let ctx = RenderCtx {
+            session: &session,
+            git: &git,
+            other: &other,
+            burn: &burn,
+            agents: &agents,
+            tick: 0,
+        };
+        let cfg = QuotasConfig::default();
+        let r = Quotas.render(Size::M, &cfg, &ctx);
+        assert!(
+            r.text.contains(CLOCK_5H),
+            "hourly glyph present: {}",
+            r.text
+        );
+        assert!(
+            r.text.contains(CALENDAR_7D),
+            "weekly glyph present: {}",
+            r.text
+        );
+        assert!(
+            !r.text.contains(DESIGN_Q),
+            "design glyph absent when None: {}",
+            r.text
+        );
+        assert!(
+            !r.text.contains(SONNET_Q),
+            "sonnet glyph absent when None: {}",
+            r.text
+        );
+    }
+
+    #[test]
+    fn quotas_design_sonnet_inert_until_session_input_lands() {
+        // design/sonnet config plumbing exists, but Session has no input
+        // fields for them yet — so even with overrides set, those buckets
+        // never render. Hourly/weekly still work normally.
+        let (mut session, git, other, burn, agents) = mkctx();
+        session.r5h = Some(10);
+        session.r7d = Some(20);
+        let ctx = RenderCtx {
+            session: &session,
+            git: &git,
+            other: &other,
+            burn: &burn,
+            agents: &agents,
+            tick: 0,
+        };
+        let cfg = QuotasConfig {
+            design: Some(PctConfig::default()),
+            sonnet: Some(PctConfig::default()),
+            ..QuotasConfig::default()
+        };
+        let r = Quotas.render(Size::M, &cfg, &ctx);
+        assert!(r.text.contains(CLOCK_5H));
+        assert!(r.text.contains(CALENDAR_7D));
+        assert!(!r.text.contains(DESIGN_Q));
+        assert!(!r.text.contains(SONNET_Q));
+    }
+
+    #[test]
+    fn quotas_per_bucket_mode_overrides_parent() {
+        // Parent mode = percent; hourly overrides to vbar. Verify hourly
+        // bucket renders the vbar glyph (50% → ▄) and weekly still renders
+        // the percent text "50%".
+        let (mut session, git, other, burn, agents) = mkctx();
+        session.r5h = Some(50);
+        session.r7d = Some(50);
+        let ctx = RenderCtx {
+            session: &session,
+            git: &git,
+            other: &other,
+            burn: &burn,
+            agents: &agents,
+            tick: 0,
+        };
+        let cfg = QuotasConfig {
+            pct: PctConfig {
+                mode: PctMode::Percent,
+                ..PctConfig::default()
+            },
+            hourly: Some(PctConfig {
+                mode: PctMode::Vbar,
+                ..PctConfig::default()
+            }),
+            ..QuotasConfig::default()
+        };
+        let r = Quotas.render(Size::M, &cfg, &ctx);
+        // Split on the bucket separator's `·` to isolate each section.
+        let parts: Vec<&str> = r.text.split('·').collect();
+        assert_eq!(parts.len(), 2, "two buckets joined: {}", r.text);
+        assert!(
+            parts[0].contains('▄'),
+            "hourly should render vbar (50%% → ▄): {}",
+            parts[0]
+        );
+        assert!(
+            !parts[0].contains("50%"),
+            "hourly should NOT contain percent text: {}",
+            parts[0]
+        );
+        assert!(
+            parts[1].contains("50%"),
+            "weekly should still render percent text: {}",
+            parts[1]
+        );
+    }
+
+    #[test]
+    fn quotas_missing_resets_at_falls_back_to_threshold_color() {
+        // With reset = None and pct >= 80, pct_color falls back to FG_RED
+        // via the static threshold band.
+        let (mut session, git, other, burn, agents) = mkctx();
+        session.r5h = Some(85);
+        session.r5h_reset = None;
+        let ctx = RenderCtx {
+            session: &session,
+            git: &git,
+            other: &other,
+            burn: &burn,
+            agents: &agents,
+            tick: 0,
+        };
+        let cfg = QuotasConfig::default();
+        let r = Quotas.render(Size::M, &cfg, &ctx);
+        // FG_RED escape — hard-coded to "\x1b[31m" in glyphs.rs.
+        assert!(
+            r.text.contains("\x1b[31m"),
+            "fallback red color present: {:?}",
             r.text
         );
     }

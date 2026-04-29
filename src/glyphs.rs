@@ -23,6 +23,9 @@ pub const DOCKER: &str = "\u{f308}";
 pub const CTX: &str = "\u{f0a0}";
 pub const CLOCK_5H: &str = "\u{f017}";
 pub const CALENDAR_7D: &str = "\u{f073}";
+// Quota bucket glyphs for design-partner and sonnet model quotas.
+pub const DESIGN_Q: &str = "\u{f0aa6}"; // nf-md-palette
+pub const SONNET_Q: &str = "\u{f035c}"; // nf-md-music_note
 pub const EFFORT: &str = "\u{f0e7}";
 pub const AGENT: &str = "\u{f0c0}";
 pub const AHEAD: &str = "↑";
