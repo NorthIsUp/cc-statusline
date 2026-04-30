@@ -52,7 +52,7 @@ fn n_i64(v: &Value, path: &[&str]) -> i64 {
     cur.as_f64().map(|x| x as i64).unwrap_or(0)
 }
 
-fn ts_to_epoch(s: &str) -> Option<i64> {
+pub fn ts_to_epoch(s: &str) -> Option<i64> {
     if s.is_empty() {
         return None;
     }

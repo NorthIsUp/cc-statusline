@@ -161,6 +161,10 @@ stack_separator   = "─•─"
 stack_glyph       = ""   # nf-oct-git_branch
 force_stack       = false
 stack_refresh_ttl = 60
+# Drop merged PRs older than this many hours from the chips chain. The
+# current branch's own PR is never filtered. Stack mode (gt) bypasses the
+# filter entirely. Set to 0 to disable.
+collapse_merged_after_hours = 36
 
 [model]
 priority = 80

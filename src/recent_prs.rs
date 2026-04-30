@@ -35,6 +35,10 @@ pub struct PrEntry {
     pub state: String,
     pub is_draft: bool,
     pub number: u64,
+    /// Unix epoch seconds when the PR was merged. `None` if not merged or
+    /// the timestamp could not be parsed (defensive: treat unknown as
+    /// "do not collapse" rather than dropping).
+    pub merged_at: Option<i64>,
 }
 
 impl RecentPrs {
@@ -138,7 +142,7 @@ pub fn run_refresh() {
 const QUERY: &str = r#"query {
   viewer {
     pullRequests(first: 100, orderBy: {field: UPDATED_AT, direction: DESC}, states: [OPEN, MERGED, CLOSED]) {
-      nodes { url state isDraft number }
+      nodes { url state isDraft number mergedAt }
     }
   }
 }"#;
@@ -171,12 +175,17 @@ fn fetch() -> Option<HashMap<String, PrEntry>> {
             .to_string();
         let is_draft = n.get("isDraft").and_then(|x| x.as_bool()).unwrap_or(false);
         let number = n.get("number").and_then(|x| x.as_u64()).unwrap_or(0);
+        let merged_at = n
+            .get("mergedAt")
+            .and_then(|x| x.as_str())
+            .and_then(crate::input::ts_to_epoch);
         map.insert(
             url,
             PrEntry {
                 state,
                 is_draft,
                 number,
+                merged_at,
             },
         );
     }
