@@ -426,6 +426,11 @@
           "default": false,
           "type": "boolean"
         },
+        "merged_summary": {
+          "description": "When the merge-age filter drops ≥1 merged PRs from the chain, prepend a `<merged_glyph>×N` summary chip indicating how many were collapsed. Set to `false` to suppress. Stack mode bypasses the filter, so the summary chip never renders there.",
+          "default": true,
+          "type": "boolean"
+        },
         "min": {
           "description": "Don't shrink past this size. None = component's smallest.",
           "anyOf": [

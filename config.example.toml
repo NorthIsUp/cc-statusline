@@ -165,6 +165,11 @@ stack_refresh_ttl = 60
 # current branch's own PR is never filtered. Stack mode (gt) bypasses the
 # filter entirely. Set to 0 to disable.
 collapse_merged_after_hours = 36
+# When ≥1 merged PRs are collapsed by the filter above, prepend a
+# `<merged_glyph>×N` summary chip to the chain in the merged-state color.
+# Stack mode bypasses the filter, so the summary chip never renders there.
+# Set to false to suppress.
+merged_summary = true
 
 [model]
 priority = 80

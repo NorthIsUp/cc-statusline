@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-04-30
+
+### Added
+
+- `[chips] merged_summary` (default `true`) prepends a `<merged_glyph>×N`
+  summary chip to the chips chain when the merge-age filter
+  (`collapse_merged_after_hours`) collapses ≥1 merged PRs. Renders in the
+  same merged-state color as individual merged chips and is intentionally
+  not OSC-8 hyperlinked. Stack mode bypasses the filter, so the summary
+  chip never appears there. Set to `false` to suppress. (Closes #20)
+
 ## [0.1.11] - 2026-04-29
 
 ### Added

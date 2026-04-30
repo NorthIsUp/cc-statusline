@@ -419,6 +419,11 @@ pub struct ChipsConfig {
     /// (gt) bypasses the filter entirely — stacked PRs are by definition
     /// relevant.
     pub collapse_merged_after_hours: u32,
+    /// When the merge-age filter drops ≥1 merged PRs from the chain, prepend
+    /// a `<merged_glyph>×N` summary chip indicating how many were collapsed.
+    /// Set to `false` to suppress. Stack mode bypasses the filter, so the
+    /// summary chip never renders there.
+    pub merged_summary: bool,
     #[serde(flatten)]
     pub common: crate::component::ComponentConfig,
 }
@@ -432,6 +437,7 @@ impl Default for ChipsConfig {
             force_stack: false,
             stack_refresh_ttl: 60,
             collapse_merged_after_hours: 36,
+            merged_summary: true,
             common: crate::component::ComponentConfig::default(),
         }
     }
@@ -439,9 +445,16 @@ impl Default for ChipsConfig {
 
 pub struct Chips;
 
+/// Result of `filter_collapsed_merged`: the kept URLs in original order plus
+/// the count of merged PRs that were dropped (collapsed out).
+pub(crate) struct CollapsedMergedFilter {
+    pub kept: Vec<String>,
+    pub dropped: usize,
+}
+
 /// Filter out merged PRs older than `cutoff_hours` from `urls`. Never drops
 /// `current_url` (the active branch's PR). When `cutoff_hours == 0` or
-/// `bypass` is true (stack mode), returns `urls` unchanged.
+/// `bypass` is true (stack mode), returns `urls` unchanged with `dropped = 0`.
 fn filter_collapsed_merged(
     urls: &[String],
     states: &std::collections::HashMap<String, crate::transcript::PrStateLite>,
@@ -449,16 +462,20 @@ fn filter_collapsed_merged(
     current_url: &str,
     bypass: bool,
     now: i64,
-) -> Vec<String> {
+) -> CollapsedMergedFilter {
     if bypass || cutoff_hours == 0 {
-        return urls.to_vec();
+        return CollapsedMergedFilter {
+            kept: urls.to_vec(),
+            dropped: 0,
+        };
     }
     let cutoff = now - (cutoff_hours as i64) * 3600;
-    urls.iter()
-        .filter(|u| {
-            if u.as_str() == current_url {
-                return true;
-            }
+    let mut kept = Vec::with_capacity(urls.len());
+    let mut dropped = 0usize;
+    for u in urls {
+        let keep = if u.as_str() == current_url {
+            true
+        } else {
             match states.get(u.as_str()) {
                 Some(s) if s.state == "MERGED" => match s.merged_at {
                     Some(ts) => ts >= cutoff,
@@ -466,9 +483,14 @@ fn filter_collapsed_merged(
                 },
                 _ => true,
             }
-        })
-        .cloned()
-        .collect()
+        };
+        if keep {
+            kept.push(u.clone());
+        } else {
+            dropped += 1;
+        }
+    }
+    CollapsedMergedFilter { kept, dropped }
 }
 
 fn pr_color_for(other: &crate::transcript::OtherPrs, url: &str) -> &'static str {
@@ -581,7 +603,10 @@ impl Component for Chips {
         // stacked PRs are always relevant.
         let bypass_filter = stack.is_some();
         let now = crate::cache::now_epoch();
-        let filtered_urls = filter_collapsed_merged(
+        let CollapsedMergedFilter {
+            kept: filtered_urls,
+            dropped: dropped_count,
+        } = filter_collapsed_merged(
             &ctx.other.urls,
             &ctx.other.states,
             cfg.collapse_merged_after_hours,
@@ -600,6 +625,8 @@ impl Component for Chips {
             }
             _ => match stack {
                 Some(urls) if !urls.is_empty() => {
+                    // Stack mode bypasses the merge-age filter, so the
+                    // summary chip never renders here (dropped_count is 0).
                     let sep = format!("{DIM}{}{RESET}", cfg.stack_separator);
                     let glyph = if cfg.stack_glyph.is_empty() {
                         String::new()
@@ -612,8 +639,16 @@ impl Component for Chips {
                 }
                 _ => {
                     // Legacy path: leading PR_OPEN icon, space-separated chips
-                    // in their original (transcript-discovered) order.
+                    // in their original (transcript-discovered) order. When
+                    // ≥1 merged PRs were collapsed by the filter, prepend a
+                    // `<merged_glyph>×N` summary chip in the merged color.
+                    // The summary chip is intentionally not OSC-8 hyperlinked
+                    // (no single URL applies).
                     let mut parts = String::new();
+                    if cfg.merged_summary && dropped_count > 0 {
+                        parts.push(' ');
+                        parts.push_str(&format!("{FG_GH_MERGED}{MERGED}×{dropped_count}{RESET}"));
+                    }
                     for u in &filtered_urls {
                         parts.push(' ');
                         parts.push_str(&render_chip(ctx.other, u));
@@ -2099,6 +2134,117 @@ mod tests {
         assert!(
             txt.contains("#102"),
             "current branch PR never filtered: {txt}"
+        );
+    }
+
+    #[test]
+    fn chips_renders_merged_summary_when_collapsed() {
+        let now = crate::cache::now_epoch();
+        let old = now - 100 * 3600;
+        // 3 collapsed merged PRs + 1 visible open PR.
+        let other = other_with_states(
+            vec![201, 202, 203, 301],
+            vec![
+                (201, lite_merged(Some(old))),
+                (202, lite_merged(Some(old))),
+                (203, lite_merged(Some(old))),
+                (301, lite_state("OPEN")),
+            ],
+        );
+        let cfg = ChipsConfig::default();
+        let txt = render_chips(&other, &cfg, "https://github.com/foo/bar/pull/999");
+        assert!(
+            txt.contains(&format!("{MERGED}×3")),
+            "summary chip with ×3 expected: {txt}"
+        );
+        // Summary chip must appear before the remaining chip(s).
+        let summary_pos = txt
+            .find(&format!("{MERGED}×3"))
+            .expect("summary chip present");
+        let chip_pos = txt.find("#301").expect("open chip present");
+        assert!(summary_pos < chip_pos, "summary before chips: {txt}");
+        // Collapsed chips themselves should not appear.
+        assert!(!txt.contains("#201"), "collapsed dropped: {txt}");
+        assert!(!txt.contains("#202"), "collapsed dropped: {txt}");
+        assert!(!txt.contains("#203"), "collapsed dropped: {txt}");
+        // Not OSC-8 hyperlinked: the merged-summary substring must not be
+        // wrapped in a `\x1b]8;;<url>` escape pair around the glyph.
+        // (Individual chips elsewhere may still carry OSC-8.) The summary
+        // segment itself is plain ANSI.
+        let idx = summary_pos;
+        // Check there is no OSC-8 opener immediately before the summary
+        // colour escape. The summary is rendered as
+        // `<FG_GH_MERGED><MERGED>×3<RESET>` with no `\x1b]8;;` prefix.
+        let before = &txt[..idx];
+        assert!(
+            !before.ends_with("\x1b\\"),
+            "no OSC-8 opener immediately before summary: {txt}"
+        );
+    }
+
+    #[test]
+    fn chips_no_summary_when_zero_collapsed() {
+        let now = crate::cache::now_epoch();
+        let recent = now - 3600;
+        let other = other_with_states(
+            vec![401, 402],
+            vec![(401, lite_state("OPEN")), (402, lite_merged(Some(recent)))],
+        );
+        let cfg = ChipsConfig::default();
+        let txt = render_chips(&other, &cfg, "https://github.com/foo/bar/pull/999");
+        assert!(
+            !txt.contains(&format!("{MERGED}×")),
+            "no summary when nothing collapsed: {txt}"
+        );
+    }
+
+    #[test]
+    fn chips_summary_disabled_via_config() {
+        let now = crate::cache::now_epoch();
+        let old = now - 100 * 3600;
+        let other = other_with_states(
+            vec![501, 502, 503],
+            vec![
+                (501, lite_merged(Some(old))),
+                (502, lite_merged(Some(old))),
+                (503, lite_state("OPEN")),
+            ],
+        );
+        let cfg = ChipsConfig {
+            merged_summary: false,
+            ..ChipsConfig::default()
+        };
+        let txt = render_chips(&other, &cfg, "https://github.com/foo/bar/pull/999");
+        assert!(
+            !txt.contains(&format!("{MERGED}×")),
+            "summary suppressed via config: {txt}"
+        );
+        assert!(txt.contains("#503"), "remaining chip rendered: {txt}");
+    }
+
+    #[test]
+    fn chips_no_summary_in_stack_mode() {
+        let now = crate::cache::now_epoch();
+        let old = now - 100 * 3600;
+        let mut other = other_with_states(
+            vec![601, 602, 603],
+            vec![
+                (601, lite_merged(Some(old))),
+                (602, lite_merged(Some(old))),
+                (603, lite_state("OPEN")),
+            ],
+        );
+        other.is_gt = true;
+        other.stack_entries = vec![
+            entry("feat/a", Some(601), 1),
+            entry("feat/b", Some(602), 2),
+            entry("feat/c", Some(603), 3),
+        ];
+        let cfg = ChipsConfig::default();
+        let txt = render_chips(&other, &cfg, "https://github.com/foo/bar/pull/999");
+        assert!(
+            !txt.contains(&format!("{MERGED}×")),
+            "no summary in stack mode: {txt}"
         );
     }
 
