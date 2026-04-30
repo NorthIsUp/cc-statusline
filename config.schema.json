@@ -404,6 +404,13 @@
       "description": "`[chips]` config block. Common ComponentConfig fields (priority/min/sizes/ required/default) live alongside chips-specific stack-mode knobs.\n\nIn stack mode (Graphite detected and ≥2 chip PRs covered by the stack), chips are reordered by depth and joined with `stack_separator`, prefixed by `stack_glyph` in dim cyan. Set `force_stack=true` to use the stack layout even without `gt`; set `stack_glyph=\"\"` to suppress the leading glyph.",
       "type": "object",
       "properties": {
+        "collapse_merged_after_hours": {
+          "description": "Drop merged PRs older than this many hours from the chips chain. `0` disables the filter (every merged PR is rendered regardless of age). The current branch's own PR is never filtered. Stack mode (gt) bypasses the filter entirely — stacked PRs are by definition relevant.",
+          "default": 36,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
         "default": {
           "description": "Override of the default size. None = component's `default_size()`.",
           "anyOf": [

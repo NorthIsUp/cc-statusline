@@ -413,6 +413,12 @@ pub struct ChipsConfig {
     pub stack_glyph: String,
     pub force_stack: bool,
     pub stack_refresh_ttl: i64,
+    /// Drop merged PRs older than this many hours from the chips chain.
+    /// `0` disables the filter (every merged PR is rendered regardless of
+    /// age). The current branch's own PR is never filtered. Stack mode
+    /// (gt) bypasses the filter entirely — stacked PRs are by definition
+    /// relevant.
+    pub collapse_merged_after_hours: u32,
     #[serde(flatten)]
     pub common: crate::component::ComponentConfig,
 }
@@ -425,12 +431,45 @@ impl Default for ChipsConfig {
             stack_glyph: BRANCH.into(),
             force_stack: false,
             stack_refresh_ttl: 60,
+            collapse_merged_after_hours: 36,
             common: crate::component::ComponentConfig::default(),
         }
     }
 }
 
 pub struct Chips;
+
+/// Filter out merged PRs older than `cutoff_hours` from `urls`. Never drops
+/// `current_url` (the active branch's PR). When `cutoff_hours == 0` or
+/// `bypass` is true (stack mode), returns `urls` unchanged.
+fn filter_collapsed_merged(
+    urls: &[String],
+    states: &std::collections::HashMap<String, crate::transcript::PrStateLite>,
+    cutoff_hours: u32,
+    current_url: &str,
+    bypass: bool,
+    now: i64,
+) -> Vec<String> {
+    if bypass || cutoff_hours == 0 {
+        return urls.to_vec();
+    }
+    let cutoff = now - (cutoff_hours as i64) * 3600;
+    urls.iter()
+        .filter(|u| {
+            if u.as_str() == current_url {
+                return true;
+            }
+            match states.get(u.as_str()) {
+                Some(s) if s.state == "MERGED" => match s.merged_at {
+                    Some(ts) => ts >= cutoff,
+                    None => true, // unknown timestamp → keep
+                },
+                _ => true,
+            }
+        })
+        .cloned()
+        .collect()
+}
 
 fn pr_color_for(other: &crate::transcript::OtherPrs, url: &str) -> &'static str {
     match other.states.get(url) {
@@ -538,13 +577,25 @@ impl Component for Chips {
         }
 
         let stack = stack_ordered_urls(ctx.other, cfg.force_stack);
+        // Stack mode (gt or force_stack) bypasses the merge-age filter;
+        // stacked PRs are always relevant.
+        let bypass_filter = stack.is_some();
+        let now = crate::cache::now_epoch();
+        let filtered_urls = filter_collapsed_merged(
+            &ctx.other.urls,
+            &ctx.other.states,
+            cfg.collapse_merged_after_hours,
+            &ctx.git.pr.url,
+            bypass_filter,
+            now,
+        );
 
         match size {
             Size::S | Size::M => {
                 // Compact: still ×N count even in stack mode (Xs already
                 // dropped earlier; Sm+ shows the chain, but only at L+ here
                 // because the fixed sizes() list is Xs/S/M/Xl).
-                let n = ctx.other.urls.len();
+                let n = filtered_urls.len();
                 Rendered::from_text(format!("{DIM}{PR_OPEN}×{n}{RESET}"))
             }
             _ => match stack {
@@ -563,7 +614,7 @@ impl Component for Chips {
                     // Legacy path: leading PR_OPEN icon, space-separated chips
                     // in their original (transcript-discovered) order.
                     let mut parts = String::new();
-                    for u in &ctx.other.urls {
+                    for u in &filtered_urls {
                         parts.push(' ');
                         parts.push_str(&render_chip(ctx.other, u));
                     }
@@ -1938,5 +1989,135 @@ mod tests {
             !r.text.contains(&cfg.stack_separator),
             "no stack separator in legacy mode"
         );
+    }
+
+    // ─── collapse_merged_after_hours filter tests ────────────────────────
+
+    fn lite_merged(ts: Option<i64>) -> crate::transcript::PrStateLite {
+        crate::transcript::PrStateLite {
+            state: "MERGED".into(),
+            is_draft: false,
+            merged_at: ts,
+        }
+    }
+
+    fn lite_state(state: &str) -> crate::transcript::PrStateLite {
+        crate::transcript::PrStateLite {
+            state: state.into(),
+            is_draft: false,
+            merged_at: None,
+        }
+    }
+
+    fn other_with_states(
+        urls: Vec<u32>,
+        states: Vec<(u32, crate::transcript::PrStateLite)>,
+    ) -> OtherPrs {
+        let url_map: std::collections::HashMap<String, crate::transcript::PrStateLite> =
+            states.into_iter().map(|(n, s)| (url(n), s)).collect();
+        OtherPrs {
+            urls: urls.into_iter().map(url).collect(),
+            states: url_map,
+            is_gt: false,
+            stack_entries: vec![],
+        }
+    }
+
+    fn render_chips(other: &OtherPrs, cfg: &ChipsConfig, current_url: &str) -> String {
+        let (session, mut git, _o, burn, agents) = mkctx();
+        git.pr.url = current_url.into();
+        let ctx = RenderCtx {
+            session: &session,
+            git: &git,
+            other,
+            burn: &burn,
+            agents: &agents,
+            tick: 0,
+        };
+        Chips.render(Size::Xl, cfg, &ctx).text
+    }
+
+    #[test]
+    fn chips_filters_old_merged_pr() {
+        let now = crate::cache::now_epoch();
+        let merged_48h = now - 48 * 3600;
+        let other = other_with_states(vec![101, 102], vec![(102, lite_merged(Some(merged_48h)))]);
+        let cfg = ChipsConfig::default(); // 36h cutoff
+        let txt = render_chips(&other, &cfg, "https://github.com/foo/bar/pull/999");
+        assert!(txt.contains("#101"), "kept: {txt}");
+        assert!(!txt.contains("#102"), "old merged dropped: {txt}");
+    }
+
+    #[test]
+    fn chips_keeps_recent_merged_pr() {
+        let now = crate::cache::now_epoch();
+        let merged_12h = now - 12 * 3600;
+        let other = other_with_states(vec![101, 102], vec![(102, lite_merged(Some(merged_12h)))]);
+        let cfg = ChipsConfig::default();
+        let txt = render_chips(&other, &cfg, "https://github.com/foo/bar/pull/999");
+        assert!(txt.contains("#101"));
+        assert!(txt.contains("#102"), "recent merged kept: {txt}");
+    }
+
+    #[test]
+    fn chips_keeps_merged_with_unknown_timestamp() {
+        let other = other_with_states(vec![101, 102], vec![(102, lite_merged(None))]);
+        let cfg = ChipsConfig::default();
+        let txt = render_chips(&other, &cfg, "https://github.com/foo/bar/pull/999");
+        assert!(txt.contains("#102"), "merged with no ts kept: {txt}");
+    }
+
+    #[test]
+    fn chips_collapse_zero_disables_filter() {
+        let now = crate::cache::now_epoch();
+        let merged_old = now - 30 * 24 * 3600;
+        let other = other_with_states(vec![101, 102], vec![(102, lite_merged(Some(merged_old)))]);
+        let cfg = ChipsConfig {
+            collapse_merged_after_hours: 0,
+            ..ChipsConfig::default()
+        };
+        let txt = render_chips(&other, &cfg, "https://github.com/foo/bar/pull/999");
+        assert!(txt.contains("#102"), "filter disabled: {txt}");
+    }
+
+    #[test]
+    fn chips_keeps_old_closed_pr() {
+        let other = other_with_states(vec![101, 102], vec![(102, lite_state("CLOSED"))]);
+        let cfg = ChipsConfig::default();
+        let txt = render_chips(&other, &cfg, "https://github.com/foo/bar/pull/999");
+        assert!(txt.contains("#102"), "closed not affected: {txt}");
+    }
+
+    #[test]
+    fn chips_never_filters_current_branch_pr() {
+        let now = crate::cache::now_epoch();
+        let merged_48h = now - 48 * 3600;
+        // #102 is the current branch PR AND merged 48h ago.
+        let other = other_with_states(vec![101, 102], vec![(102, lite_merged(Some(merged_48h)))]);
+        let cfg = ChipsConfig::default();
+        let txt = render_chips(&other, &cfg, &url(102));
+        assert!(
+            txt.contains("#102"),
+            "current branch PR never filtered: {txt}"
+        );
+    }
+
+    #[test]
+    fn chips_stack_mode_bypasses_filter() {
+        let now = crate::cache::now_epoch();
+        let merged_old = now - 100 * 3600;
+        let mut other = other_with_states(
+            vec![101, 102],
+            vec![
+                (101, lite_merged(Some(merged_old))),
+                (102, lite_merged(Some(merged_old))),
+            ],
+        );
+        other.is_gt = true;
+        other.stack_entries = vec![entry("feat/a", Some(101), 1), entry("feat/b", Some(102), 2)];
+        let cfg = ChipsConfig::default();
+        let txt = render_chips(&other, &cfg, "https://github.com/foo/bar/pull/999");
+        assert!(txt.contains("#101"), "stack bypass: {txt}");
+        assert!(txt.contains("#102"), "stack bypass: {txt}");
     }
 }

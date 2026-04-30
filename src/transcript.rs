@@ -50,6 +50,8 @@ pub struct StackChipEntry {
 pub struct PrStateLite {
     pub state: String,
     pub is_draft: bool,
+    /// Unix epoch seconds the PR was merged, or `None` if open/closed/unknown.
+    pub merged_at: Option<i64>,
 }
 
 pub fn other_prs_view(st: &State, origin_url: &str) -> OtherPrs {
@@ -73,6 +75,7 @@ pub fn other_prs_view(st: &State, origin_url: &str) -> OtherPrs {
                 PrStateLite {
                     state: entry.state.clone(),
                     is_draft: entry.is_draft,
+                    merged_at: entry.merged_at,
                 },
             );
         }

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-04-29
+
+### Added
+
+- `[chips] collapse_merged_after_hours` (default `36`; `0` disables) drops
+  merged PRs older than the cutoff from the chips chain. Reduces visual
+  noise when the chain accumulates days-old merged PRs. The current
+  branch's own PR is never filtered, and stack mode (gt) bypasses the
+  filter entirely. (Closes #18)
+- `PrEntry.merged_at` (Unix epoch seconds) added to the recent-PRs cache;
+  the GraphQL query now requests `mergedAt` and parses ISO8601 inline.
+  Cache is keyed to the binary version so the schema change triggers a
+  one-shot refresh on first run after upgrade.
+
 ## [0.1.10] - 2026-04-29
 
 ### Added
