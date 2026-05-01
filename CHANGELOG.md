@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-04-30
+
+### Fixed
+
+- `--refresh-recent-prs` now performs a second-pass batched GraphQL
+  hydration for PR URLs referenced by any session's `other_prs.urls`
+  but missing from the `viewer.pullRequests` window (which is capped at
+  the 100 most-recently-updated PRs). Older PRs that scrolled off the
+  window — but are still mentioned in long-running session transcripts —
+  now get correct `state` and `merged_at`, so chip rendering and the
+  `collapse_merged_after_hours` filter work uniformly across the whole
+  conversation. Lookups are batched in groups of 50 aliased
+  `repository.pullRequest` fields under the existing refresh lock; a
+  failed alias is skipped without poisoning the batch. (#24, closes #24)
+
 ## [0.1.13] - 2026-04-30
 
 ### Fixed
