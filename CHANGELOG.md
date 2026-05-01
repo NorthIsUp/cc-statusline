@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.13] - 2026-04-30
+
+### Fixed
+
+- Layout autoresize treats `cfg.min` as a SOFT preference: when the bar
+  still overflows after the normal shrink loop, a new relax pass shrinks
+  pinned items below their `min` toward the component's intrinsic
+  smallest size (lowest priority first) before any items are dropped.
+  Previously, a config like `[chips] min = "xl"` with 50+ PRs at a narrow
+  terminal width could drop chips entirely, leaving the bar blank. Chips
+  now degrade to their compact `×N` form instead. (#22, closes #22)
+
 ## [0.1.12] - 2026-04-30
 
 ### Added
