@@ -63,6 +63,14 @@ pub fn render(ctx: &RenderCtx, state: &mut State, cols: u32) -> String {
                 break;
             }
         }
+        // Soft-min relax: items pinned by `cfg.min` may still have intrinsic
+        // sizes below their soft min. Before dropping anything, allow shrinking
+        // those items toward their intrinsic minimum, lowest priority first.
+        while total_width(&left_items, &right_items, gap) > cols {
+            if !relax_one(&mut left_items, &mut right_items, ctx) {
+                break;
+            }
+        }
         // If still too wide, drop lowest-priority non-required items.
         while total_width(&left_items, &right_items, gap) > cols {
             if !drop_one(&mut left_items, &mut right_items) {
@@ -186,6 +194,11 @@ struct Item {
     cfg: ComponentConfig,
     size: Size,
     sizes: Vec<Size>, // allowed sizes, smallest → largest, filtered by cfg.sizes & min
+    /// Intrinsic component sizes (full unfiltered list from `components::sizes_for`).
+    /// Used by the soft-min relax pass: when overflow persists after normal
+    /// shrink is exhausted, we relax `cfg.min` and continue shrinking down to
+    /// the intrinsic minimum before resorting to dropping items.
+    intrinsic_sizes: Vec<Size>,
     dropped: bool,
     rendered: crate::component::Rendered,
 }
@@ -193,8 +206,10 @@ struct Item {
 impl Item {
     fn new(name: &str, cfg: &ComponentConfig) -> Option<Self> {
         let all = components::sizes_for(name)?;
-        // Filter to allowed sizes per cfg.
-        let mut allowed: Vec<Size> = if cfg.sizes.is_empty() {
+        // Intrinsic full list (sorted smallest → largest, after `cfg.sizes`
+        // filtering — explicit allowed-size restrictions are still hard, only
+        // `cfg.min` is treated as soft).
+        let mut intrinsic: Vec<Size> = if cfg.sizes.is_empty() {
             all.to_vec()
         } else {
             all.iter()
@@ -202,12 +217,18 @@ impl Item {
                 .filter(|s| cfg.sizes.contains(s))
                 .collect()
         };
-        // Apply min.
+        intrinsic.sort();
+        if intrinsic.is_empty() {
+            return None;
+        }
+        // Apply soft min to compute the normal-shrink-allowed list.
+        let mut allowed: Vec<Size> = intrinsic.clone();
         if let Some(m) = cfg.min {
             allowed.retain(|s| *s >= m);
         }
         if allowed.is_empty() {
-            return None;
+            // Soft min eliminated everything; fall back to intrinsic.
+            allowed = intrinsic.clone();
         }
         allowed.sort();
         let default = cfg
@@ -227,6 +248,7 @@ impl Item {
             cfg: cfg.clone(),
             size: default,
             sizes: allowed,
+            intrinsic_sizes: intrinsic,
             dropped: false,
             rendered: Default::default(),
         })
@@ -234,6 +256,12 @@ impl Item {
 
     fn min_size(&self) -> Size {
         *self.sizes.first().unwrap()
+    }
+
+    /// The intrinsic (hard) minimum — the smallest size the component can
+    /// actually render at, regardless of `cfg.min`.
+    fn intrinsic_min(&self) -> Size {
+        *self.intrinsic_sizes.first().unwrap()
     }
 }
 
@@ -342,6 +370,52 @@ fn shrink_one(left: &mut [Item], right: &mut [Item], ctx: &RenderCtx) -> bool {
     true
 }
 
+/// Soft-min relax pass. Picks the lowest-priority item whose current size is
+/// at-or-below its soft `cfg.min` but still above its intrinsic minimum, then
+/// shrinks it one intrinsic step. Used after `shrink_one` is exhausted but
+/// before `drop_one` runs, so a heavily pinned bar (e.g. `chips.min = "xl"`)
+/// still degrades to its compact form rather than disappearing entirely.
+/// Returns false when no candidate remains.
+fn relax_one(left: &mut [Item], right: &mut [Item], ctx: &RenderCtx) -> bool {
+    let mut best: Option<(bool, usize, u32)> = None;
+    for (i, it) in left.iter().enumerate() {
+        if it.dropped || it.size <= it.intrinsic_min() {
+            continue;
+        }
+        let p = it.cfg.priority;
+        if best.map(|(_, _, bp)| p < bp).unwrap_or(true) {
+            best = Some((true, i, p));
+        }
+    }
+    for (i, it) in right.iter().enumerate() {
+        if it.dropped || it.size <= it.intrinsic_min() {
+            continue;
+        }
+        let p = it.cfg.priority;
+        if best.map(|(_, _, bp)| p < bp).unwrap_or(true) {
+            best = Some((false, i, p));
+        }
+    }
+    let (in_left, idx, _) = match best {
+        Some(b) => b,
+        None => return false,
+    };
+    let it = if in_left {
+        &mut left[idx]
+    } else {
+        &mut right[idx]
+    };
+    let new_size = it
+        .intrinsic_sizes
+        .iter()
+        .copied()
+        .rfind(|s| *s < it.size)
+        .unwrap_or_else(|| it.intrinsic_min());
+    it.size = new_size;
+    it.rendered = components::render_named(&it.name, new_size, ctx).unwrap_or_default();
+    true
+}
+
 fn drop_one(left: &mut [Item], right: &mut [Item]) -> bool {
     let mut best: Option<(bool, usize, u32)> = None;
     for (i, it) in left.iter().enumerate() {
@@ -405,7 +479,9 @@ fn apply_hysteresis(items: &mut [Item], state: &LayoutState, cols: u32, band: u3
                     continue;
                 }
                 if let Ok(s) = d.size.parse::<Size>() {
-                    if it.sizes.contains(&s) {
+                    // Allow restoring sizes from the intrinsic list — the
+                    // relax pass may have shrunk below the soft min.
+                    if it.intrinsic_sizes.contains(&s) {
                         it.size = s;
                     }
                 }
@@ -789,6 +865,94 @@ mod tests {
         // field exists and defaults to true).
         let lc = crate::config::LayoutConfig::default();
         assert!(lc.overflow_chips_to_second_row);
+    }
+
+    /// Issue #22: when chips is pinned `min = Xl` and the terminal is too
+    /// narrow to fit the full chain, the bar must NOT collapse to empty —
+    /// the soft-min relax pass should shrink chips to its compact form.
+    #[test]
+    fn soft_min_relaxes_before_dropping() {
+        unsafe {
+            std::env::set_var("CC_STATUSLINE_NF_WIDTH", "1");
+            std::env::set_var("CC_STATUSLINE_SAFETY_MARGIN", "0");
+        }
+        let session = mk_session(80);
+        let git = mk_git();
+        // 50+ PRs so the Xl chain blows past any reasonable width.
+        let other = chips_other((101..=160).collect());
+        let burn = crate::transcript::BurnInfo::default();
+        let agents = AgentCount::default();
+        let ctx = chips_ctx(&session, &git, &other, &burn, &agents);
+
+        // Build a layout with a single chips item pinned at min = Xl,
+        // mirroring the user's config from issue #22.
+        let cfg_chips = ComponentConfig {
+            sizes: vec![],
+            min: Some(Size::Xl),
+            priority: 1,
+            required: false,
+            default: Some(Size::Xl),
+        };
+        let mut left: Vec<Item> = vec![Item::new("chips", &cfg_chips).unwrap()];
+        let mut right: Vec<Item> = Vec::new();
+
+        // sanity: normal-shrink list is locked to Xl only.
+        assert_eq!(left[0].sizes, vec![Size::Xl]);
+        // intrinsic list contains smaller sizes the relax pass can step to.
+        assert!(left[0].intrinsic_sizes.iter().any(|s| *s < Size::Xl));
+
+        render_all(&mut left, &ctx);
+        let cols: u32 = 80;
+        let gap: u32 = 1;
+        // Drive the same shrink → relax → drop sequence as render().
+        while total_width(&left, &right, gap) > cols && shrink_one(&mut left, &mut right, &ctx) {}
+        while total_width(&left, &right, gap) > cols && relax_one(&mut left, &mut right, &ctx) {}
+
+        // After relax, chips must still be present and below its soft min.
+        assert!(!left[0].dropped, "chips should not be dropped");
+        assert!(
+            left[0].size < Size::Xl,
+            "chips should have shrunk past soft min, got {:?}",
+            left[0].size
+        );
+        assert!(
+            !left[0].rendered.text.is_empty(),
+            "chips render must be non-empty"
+        );
+    }
+
+    /// End-to-end via `render()`: with chips pinned `min = "xl"`, 50+ PRs in
+    /// other_prs and a narrow terminal, the resulting line is non-empty.
+    /// (We can't easily inject ComponentConfig overrides through the public
+    /// config(), so this exercises the full pipeline at the layout level.)
+    #[test]
+    fn render_non_empty_with_many_chips_at_narrow_cols() {
+        unsafe {
+            std::env::set_var("CC_STATUSLINE_NF_WIDTH", "1");
+            std::env::set_var("CC_STATUSLINE_SAFETY_MARGIN", "0");
+        }
+        let cols: u32 = 80;
+        let session = mk_session(cols);
+        let git = mk_git();
+        let other = chips_other((101..=160).collect());
+        let burn = crate::transcript::BurnInfo::default();
+        let agents = AgentCount::default();
+        let ctx = RenderCtx {
+            session: &session,
+            git: &git,
+            other: &other,
+            burn: &burn,
+            agents: &agents,
+            tick: 0,
+        };
+        let mut state = State::default();
+        let line = render(&ctx, &mut state, cols);
+        let first = line.lines().next().unwrap_or(&line);
+        let stripped = crate::vlen::strip(first);
+        assert!(
+            !stripped.trim().is_empty(),
+            "line must not be blank: {stripped:?}"
+        );
     }
 
     /// Two-line render via the public `render()` entry point: line 2 fills
