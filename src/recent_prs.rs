@@ -123,7 +123,17 @@ pub fn run_refresh() {
     cur.locked_at = now_epoch();
     let _ = cur.save();
 
-    if let Some(prs) = fetch() {
+    if let Some(mut prs) = fetch() {
+        // Second pass: hydrate any URLs referenced by other_prs.urls in any
+        // session state file that aren't already present in the freshly
+        // fetched viewer.pullRequests result. This catches PRs older than
+        // the 100 most-recently-updated `viewer.pullRequests` window.
+        let missing = collect_missing_urls(&prs);
+        if !missing.is_empty() {
+            for (url, entry) in fetch_by_urls(&missing) {
+                prs.entry(url).or_insert(entry);
+            }
+        }
         let mut new = RecentPrs {
             version: crate::state::STATE_VERSION.into(),
             fetched_at: now_epoch(),
@@ -136,6 +146,186 @@ pub fn run_refresh() {
         // keep the previously-cached prs intact.
         cur.locked_at = 0;
         let _ = cur.save();
+    }
+}
+
+/// Walks every session state TOML in `cache_dir()` (excluding `recent_prs.toml`
+/// itself) and returns the union of `other_prs.urls` entries that are missing
+/// from `have`.
+fn collect_missing_urls(have: &HashMap<String, PrEntry>) -> Vec<String> {
+    let dir = config::cache_dir();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("toml") {
+            continue;
+        }
+        if path.file_name().and_then(|s| s.to_str()) == Some("recent_prs.toml") {
+            continue;
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let st: crate::state::State = match toml::from_str(&text) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        for url in st.other_prs.urls {
+            if !have.contains_key(&url) && parse_pr_url(&url).is_some() {
+                seen.insert(url);
+            }
+        }
+    }
+    seen.into_iter().collect()
+}
+
+/// Parse `https://github.com/OWNER/REPO/pull/N` (with optional trailing
+/// path/query/fragment) into `(owner, repo, number)`. Returns `None` for any
+/// input that doesn't look like a PR URL.
+pub(crate) fn parse_pr_url(url: &str) -> Option<(String, String, u64)> {
+    let rest = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("http://github.com/"))?;
+    let mut parts = rest.split('/');
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    if parts.next()? != "pull" {
+        return None;
+    }
+    let num_part = parts.next()?;
+    let num_str: String = num_part
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if num_str.is_empty() || owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    let number: u64 = num_str.parse().ok()?;
+    Some((owner.to_string(), repo.to_string(), number))
+}
+
+/// Batched PR-by-(owner,repo,number) lookup using aliased `repository.pullRequest`
+/// fields. Splits into chunks of 50 to keep below GraphQL complexity caps and
+/// to make per-batch failure recoverable. A failed alias inside an otherwise-
+/// successful batch is skipped silently.
+fn fetch_by_urls(urls: &[String]) -> HashMap<String, PrEntry> {
+    let mut out = HashMap::new();
+    let parsed: Vec<(String, (String, String, u64))> = urls
+        .iter()
+        .filter_map(|u| parse_pr_url(u).map(|p| (u.clone(), p)))
+        .collect();
+    for chunk in parsed.chunks(50) {
+        if let Some(map) = fetch_chunk(chunk) {
+            out.extend(map);
+        }
+    }
+    out
+}
+
+fn fetch_chunk(chunk: &[(String, (String, String, u64))]) -> Option<HashMap<String, PrEntry>> {
+    let mut q = String::from("query {\n");
+    for (i, (_url, (owner, repo, number))) in chunk.iter().enumerate() {
+        // Escape: owner/repo are GitHub identifiers (alnum, dash, underscore,
+        // dot) — safe to inline. Defensive: skip any that contain quotes.
+        if owner.contains('"') || repo.contains('"') {
+            continue;
+        }
+        q.push_str(&format!(
+            "  a{i}: repository(owner: \"{owner}\", name: \"{repo}\") {{ pullRequest(number: {number}) {{ url state isDraft number mergedAt }} }}\n"
+        ));
+    }
+    q.push_str("}\n");
+
+    let out = Command::new("gh")
+        .args(["api", "graphql", "-f", &format!("query={q}")])
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_TOKEN")
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if out.stdout.is_empty() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let data = v.get("data")?.as_object()?;
+    let mut map = HashMap::new();
+    for (_alias, val) in data {
+        let pr = match val.get("pullRequest") {
+            Some(p) if !p.is_null() => p,
+            _ => continue,
+        };
+        let url = match pr.get("url").and_then(|x| x.as_str()) {
+            Some(u) => u.to_string(),
+            None => continue,
+        };
+        let state = pr
+            .get("state")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let is_draft = pr.get("isDraft").and_then(|x| x.as_bool()).unwrap_or(false);
+        let number = pr.get("number").and_then(|x| x.as_u64()).unwrap_or(0);
+        let merged_at = pr
+            .get("mergedAt")
+            .and_then(|x| x.as_str())
+            .and_then(crate::input::ts_to_epoch);
+        map.insert(
+            url,
+            PrEntry {
+                state,
+                is_draft,
+                number,
+                merged_at,
+            },
+        );
+    }
+    Some(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_pr_url_basic() {
+        assert_eq!(
+            parse_pr_url("https://github.com/foo/bar/pull/42"),
+            Some(("foo".into(), "bar".into(), 42))
+        );
+    }
+
+    #[test]
+    fn parse_pr_url_trailing_path() {
+        assert_eq!(
+            parse_pr_url("https://github.com/foo/bar/pull/42/files"),
+            Some(("foo".into(), "bar".into(), 42))
+        );
+        assert_eq!(
+            parse_pr_url("https://github.com/foo/bar/pull/42#issuecomment-1"),
+            Some(("foo".into(), "bar".into(), 42))
+        );
+    }
+
+    #[test]
+    fn parse_pr_url_with_dashes_dots() {
+        assert_eq!(
+            parse_pr_url("https://github.com/some-org/my.repo/pull/7"),
+            Some(("some-org".into(), "my.repo".into(), 7))
+        );
+    }
+
+    #[test]
+    fn parse_pr_url_rejects_non_pr() {
+        assert!(parse_pr_url("https://github.com/foo/bar/issues/1").is_none());
+        assert!(parse_pr_url("https://example.com/foo/bar/pull/1").is_none());
+        assert!(parse_pr_url("https://github.com/foo/bar/pull/").is_none());
+        assert!(parse_pr_url("https://github.com/foo/bar/pull/abc").is_none());
+        assert!(parse_pr_url("not a url").is_none());
     }
 }
 
