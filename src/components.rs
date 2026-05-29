@@ -74,11 +74,12 @@ fn worktree_suffix(ctx: &RenderCtx) -> String {
     String::new()
 }
 
-fn pr_state_color(state: &str, is_draft: bool) -> &'static str {
+fn pr_state_color(state: &str, is_draft: bool, auto_merge: bool) -> &'static str {
     match state {
         "MERGED" => FG_GH_MERGED,
         "CLOSED" => FG_GH_CLOSED,
         "OPEN" if is_draft => FG_GH_DRAFT,
+        "OPEN" if auto_merge => FG_GH_AUTO,
         "OPEN" => FG_GH_OPEN,
         _ => DIM,
     }
@@ -160,7 +161,7 @@ impl Component for PrIcon {
             return Rendered::empty();
         }
         let g = pr_state_glyph(&ctx.git.pr.state, ctx.git.pr.is_draft);
-        let c = pr_state_color(&ctx.git.pr.state, ctx.git.pr.is_draft);
+        let c = pr_state_color(&ctx.git.pr.state, ctx.git.pr.is_draft, ctx.git.pr.auto_merge());
         Rendered::from_text(format!("{c}{g}{RESET}"))
     }
 }
@@ -228,7 +229,7 @@ impl Component for PrNum {
             Some(n) => n,
             None => return Rendered::empty(),
         };
-        let c = pr_state_color(&ctx.git.pr.state, ctx.git.pr.is_draft);
+        let c = pr_state_color(&ctx.git.pr.state, ctx.git.pr.is_draft, ctx.git.pr.auto_merge());
         Rendered::from_text(format!("{c}#{n}{RESET}"))
     }
 }
@@ -419,11 +420,22 @@ pub struct ChipsConfig {
     /// (gt) bypasses the filter entirely — stacked PRs are by definition
     /// relevant.
     pub collapse_merged_after_hours: u32,
+    /// Cap the number of MERGED chips that survive the age filter. When the
+    /// kept-merged count exceeds this, the oldest-merged extras (by
+    /// `merged_at`) are collapsed regardless of age. The current branch's PR
+    /// is never collapsed. `0` disables the cap. Stack mode bypasses this
+    /// (along with the age filter).
+    pub max_merged_chips: u32,
     /// When the merge-age filter drops ≥1 merged PRs from the chain, prepend
     /// a `<merged_glyph>×N` summary chip indicating how many were collapsed.
     /// Set to `false` to suppress. Stack mode bypasses the filter, so the
     /// summary chip never renders there.
     pub merged_summary: bool,
+    /// Collapse all CLOSED chips (other than the current branch's PR) into a
+    /// single `<closed_glyph>×N` summary chip. Closed PRs are rarely
+    /// individually interesting; bunching them keeps the chain short. Set to
+    /// `false` to render each CLOSED chip individually. Stack mode bypasses.
+    pub closed_summary: bool,
     #[serde(flatten)]
     pub common: crate::component::ComponentConfig,
 }
@@ -437,7 +449,9 @@ impl Default for ChipsConfig {
             force_stack: false,
             stack_refresh_ttl: 60,
             collapse_merged_after_hours: 36,
+            max_merged_chips: 3,
             merged_summary: true,
+            closed_summary: true,
             common: crate::component::ComponentConfig::default(),
         }
     }
@@ -459,17 +473,22 @@ fn filter_collapsed_merged(
     urls: &[String],
     states: &std::collections::HashMap<String, crate::transcript::PrStateLite>,
     cutoff_hours: u32,
+    max_merged: u32,
     current_url: &str,
     bypass: bool,
     now: i64,
 ) -> CollapsedMergedFilter {
-    if bypass || cutoff_hours == 0 {
+    if bypass {
         return CollapsedMergedFilter {
             kept: urls.to_vec(),
             dropped: 0,
         };
     }
-    let cutoff = now - (cutoff_hours as i64) * 3600;
+    let cutoff = if cutoff_hours == 0 {
+        i64::MIN
+    } else {
+        now - (cutoff_hours as i64) * 3600
+    };
     let mut kept = Vec::with_capacity(urls.len());
     let mut dropped = 0usize;
     for u in urls {
@@ -490,12 +509,49 @@ fn filter_collapsed_merged(
             dropped += 1;
         }
     }
+
+    // Count cap: if more than max_merged MERGED chips survived (excluding the
+    // current PR), drop the oldest-merged ones. Unknown timestamps sort last
+    // (i.e. survive the cap), since they could be very recent.
+    if max_merged > 0 {
+        let max = max_merged as usize;
+        let merged_indices: Vec<usize> = kept
+            .iter()
+            .enumerate()
+            .filter(|(_, u)| {
+                u.as_str() != current_url
+                    && matches!(states.get(u.as_str()), Some(s) if s.state == "MERGED")
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if merged_indices.len() > max {
+            let mut sorted = merged_indices.clone();
+            // Newest first; entries with no merged_at sort newest (kept).
+            sorted.sort_by_key(|&i| std::cmp::Reverse(
+                states
+                    .get(kept[i].as_str())
+                    .and_then(|s| s.merged_at)
+                    .unwrap_or(i64::MAX),
+            ));
+            let to_drop: std::collections::HashSet<usize> =
+                sorted.into_iter().skip(max).collect();
+            let new_kept: Vec<String> = kept
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !to_drop.contains(i))
+                .map(|(_, u)| u.clone())
+                .collect();
+            dropped += to_drop.len();
+            kept = new_kept;
+        }
+    }
+
     CollapsedMergedFilter { kept, dropped }
 }
 
 fn pr_color_for(other: &crate::transcript::OtherPrs, url: &str) -> &'static str {
     match other.states.get(url) {
-        Some(s) => pr_state_color(&s.state, s.is_draft),
+        Some(s) => pr_state_color(&s.state, s.is_draft, s.auto_merge),
         None => DIM,
     }
 }
@@ -610,6 +666,7 @@ impl Component for Chips {
             &ctx.other.urls,
             &ctx.other.states,
             cfg.collapse_merged_after_hours,
+            cfg.max_merged_chips,
             &ctx.git.pr.url,
             bypass_filter,
             now,
@@ -649,7 +706,36 @@ impl Component for Chips {
                         parts.push(' ');
                         parts.push_str(&format!("{FG_GH_MERGED}{MERGED}×{dropped_count}{RESET}"));
                     }
+                    let closed_count = if cfg.closed_summary {
+                        filtered_urls
+                            .iter()
+                            .filter(|u| {
+                                u.as_str() != ctx.git.pr.url
+                                    && matches!(
+                                        ctx.other.states.get(u.as_str()),
+                                        Some(s) if s.state == "CLOSED"
+                                    )
+                            })
+                            .count()
+                    } else {
+                        0
+                    };
+                    if closed_count > 0 {
+                        parts.push(' ');
+                        parts.push_str(&format!(
+                            "{FG_GH_CLOSED}{PR_CLOSED}×{closed_count}{RESET}"
+                        ));
+                    }
                     for u in &filtered_urls {
+                        if cfg.closed_summary
+                            && u.as_str() != ctx.git.pr.url
+                            && matches!(
+                                ctx.other.states.get(u.as_str()),
+                                Some(s) if s.state == "CLOSED"
+                            )
+                        {
+                            continue;
+                        }
                         parts.push(' ');
                         parts.push_str(&render_chip(ctx.other, u));
                     }
@@ -972,16 +1058,22 @@ impl Component for CtxBar {
                     mode: PctMode::Dots,
                     ..cfg.pct.clone()
                 };
-                Rendered::from_text(pct::render(pct, &dots_cfg))
+                Rendered::from_text(format!(
+                    "{DIM}{CTX}{RESET} {}",
+                    pct::render(pct, &dots_cfg)
+                ))
             }
-            Size::S => Rendered::from_text(pct::render(pct, &cfg.pct)),
+            Size::S => Rendered::from_text(format!(
+                "{DIM}{CTX}{RESET} {}",
+                pct::render(pct, &cfg.pct)
+            )),
             Size::M => {
                 let body = pct::render(pct, &cfg.pct);
                 // For the textual modes don't double-print the percent.
                 if matches!(cfg.pct.mode, PctMode::Percent | PctMode::Float) {
-                    Rendered::from_text(body)
+                    Rendered::from_text(format!("{DIM}{CTX}{RESET} {body}"))
                 } else {
-                    Rendered::from_text(format!("{body} {pct}%"))
+                    Rendered::from_text(format!("{DIM}{CTX}{RESET} {body} {pct}%"))
                 }
             }
             Size::L => {
@@ -2033,6 +2125,7 @@ mod tests {
             state: "MERGED".into(),
             is_draft: false,
             merged_at: ts,
+            auto_merge: false,
         }
     }
 
@@ -2041,6 +2134,7 @@ mod tests {
             state: state.into(),
             is_draft: false,
             merged_at: None,
+            auto_merge: false,
         }
     }
 
@@ -2116,11 +2210,60 @@ mod tests {
     }
 
     #[test]
-    fn chips_keeps_old_closed_pr() {
+    fn chips_keeps_old_closed_pr_when_summary_disabled() {
         let other = other_with_states(vec![101, 102], vec![(102, lite_state("CLOSED"))]);
+        let cfg = ChipsConfig {
+            closed_summary: false,
+            ..ChipsConfig::default()
+        };
+        let txt = render_chips(&other, &cfg, "https://github.com/foo/bar/pull/999");
+        assert!(txt.contains("#102"), "closed kept inline: {txt}");
+    }
+
+    #[test]
+    fn chips_collapses_closed_into_summary_chip() {
+        // 3 CLOSED + 1 OPEN. Default closed_summary=true → CLOSED×3 chip
+        // appears, individual #143/#144/#176 chips do not.
+        let other = other_with_states(
+            vec![143, 144, 147, 176],
+            vec![
+                (143, lite_state("CLOSED")),
+                (144, lite_state("CLOSED")),
+                (147, lite_state("OPEN")),
+                (176, lite_state("CLOSED")),
+            ],
+        );
         let cfg = ChipsConfig::default();
         let txt = render_chips(&other, &cfg, "https://github.com/foo/bar/pull/999");
-        assert!(txt.contains("#102"), "closed not affected: {txt}");
+        assert!(
+            txt.contains(&format!("{PR_CLOSED}×3")),
+            "CLOSED×3 summary chip expected: {txt}"
+        );
+        assert!(!txt.contains("#143"), "individual closed dropped: {txt}");
+        assert!(!txt.contains("#144"), "individual closed dropped: {txt}");
+        assert!(!txt.contains("#176"), "individual closed dropped: {txt}");
+        assert!(txt.contains("#147"), "open kept inline: {txt}");
+    }
+
+    #[test]
+    fn chips_closed_summary_keeps_current_pr_inline() {
+        // Current PR is CLOSED — must still render inline, never folded into
+        // the CLOSED×N summary.
+        let other = other_with_states(
+            vec![143, 144],
+            vec![
+                (143, lite_state("CLOSED")),
+                (144, lite_state("CLOSED")),
+            ],
+        );
+        let cfg = ChipsConfig::default();
+        let txt = render_chips(&other, &cfg, &url(143));
+        assert!(txt.contains("#143"), "current closed PR kept inline: {txt}");
+        assert!(!txt.contains("#144"), "non-current closed folded: {txt}");
+        assert!(
+            txt.contains(&format!("{PR_CLOSED}×1")),
+            "CLOSED×1 summary expected: {txt}"
+        );
     }
 
     #[test]
@@ -2135,6 +2278,83 @@ mod tests {
             txt.contains("#102"),
             "current branch PR never filtered: {txt}"
         );
+    }
+
+    #[test]
+    fn chips_caps_recent_merged_by_count() {
+        let now = crate::cache::now_epoch();
+        // 5 merged PRs all within the age window, ascending merged_at: 201
+        // (oldest) → 205 (newest). Cap at 3 → drop 201, 202.
+        let other = other_with_states(
+            vec![201, 202, 203, 204, 205],
+            vec![
+                (201, lite_merged(Some(now - 10 * 3600))),
+                (202, lite_merged(Some(now - 8 * 3600))),
+                (203, lite_merged(Some(now - 6 * 3600))),
+                (204, lite_merged(Some(now - 4 * 3600))),
+                (205, lite_merged(Some(now - 2 * 3600))),
+            ],
+        );
+        let cfg = ChipsConfig {
+            max_merged_chips: 3,
+            ..ChipsConfig::default()
+        };
+        let txt = render_chips(&other, &cfg, "https://github.com/foo/bar/pull/999");
+        assert!(!txt.contains("#201"), "oldest dropped: {txt}");
+        assert!(!txt.contains("#202"), "second-oldest dropped: {txt}");
+        assert!(txt.contains("#203"), "kept: {txt}");
+        assert!(txt.contains("#204"), "kept: {txt}");
+        assert!(txt.contains("#205"), "kept: {txt}");
+        assert!(
+            txt.contains(&format!("{MERGED}×2")),
+            "summary chip ×2 expected: {txt}"
+        );
+    }
+
+    #[test]
+    fn chips_cap_zero_disables_count_cap() {
+        let now = crate::cache::now_epoch();
+        let other = other_with_states(
+            vec![201, 202, 203, 204, 205],
+            vec![
+                (201, lite_merged(Some(now - 10 * 3600))),
+                (202, lite_merged(Some(now - 8 * 3600))),
+                (203, lite_merged(Some(now - 6 * 3600))),
+                (204, lite_merged(Some(now - 4 * 3600))),
+                (205, lite_merged(Some(now - 2 * 3600))),
+            ],
+        );
+        let cfg = ChipsConfig {
+            max_merged_chips: 0,
+            ..ChipsConfig::default()
+        };
+        let txt = render_chips(&other, &cfg, "https://github.com/foo/bar/pull/999");
+        for n in [201, 202, 203, 204, 205] {
+            assert!(txt.contains(&format!("#{n}")), "no cap → all kept: {txt}");
+        }
+    }
+
+    #[test]
+    fn chips_cap_never_drops_current_pr() {
+        let now = crate::cache::now_epoch();
+        // Current PR (#201) is the oldest merged; cap=1 should still keep it
+        // and drop the other older one (#202), keeping the newest non-current.
+        let other = other_with_states(
+            vec![201, 202, 203],
+            vec![
+                (201, lite_merged(Some(now - 10 * 3600))),
+                (202, lite_merged(Some(now - 8 * 3600))),
+                (203, lite_merged(Some(now - 2 * 3600))),
+            ],
+        );
+        let cfg = ChipsConfig {
+            max_merged_chips: 1,
+            ..ChipsConfig::default()
+        };
+        let txt = render_chips(&other, &cfg, &url(201));
+        assert!(txt.contains("#201"), "current PR never dropped: {txt}");
+        assert!(!txt.contains("#202"), "extra merged dropped: {txt}");
+        assert!(txt.contains("#203"), "newest non-current kept: {txt}");
     }
 
     #[test]

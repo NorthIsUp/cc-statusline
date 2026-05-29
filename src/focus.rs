@@ -6,7 +6,6 @@ use crate::cache::now_epoch;
 use crate::config;
 use crate::input::Session;
 use crate::state::State;
-use std::process::{Command, Stdio};
 
 const ITERM_QUERY: &str = r#"
 tell application "iTerm2"
@@ -43,15 +42,12 @@ pub fn detect(session: &Session, st: &mut State) -> bool {
     match term.as_str() {
         "iTerm.app" => {
             if !our_uuid.is_empty() {
-                active_uuid = osascript(ITERM_QUERY).unwrap_or_default();
+                active_uuid = run_applescript(ITERM_QUERY).unwrap_or_default();
                 focused = active_uuid == our_uuid;
             }
         }
         "vscode" => {
-            frontmost = osascript(
-                r#"tell application "System Events" to return name of first application process whose frontmost is true"#,
-            )
-            .unwrap_or_default();
+            frontmost = frontmost_app_name().unwrap_or_default();
             focused = matches!(
                 frontmost.as_str(),
                 "Code" | "Code - Insiders" | "Cursor" | "Windsurf"
@@ -95,17 +91,32 @@ pub fn detect(session: &Session, st: &mut State) -> bool {
     focused
 }
 
-fn osascript(script: &str) -> Option<String> {
-    let out = Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
+/// Frontmost application's name via `NSWorkspace` — no AppleScript, no TCC
+/// automation permission, no subprocess. Replaces the System Events
+/// `osascript` query in the vscode branch.
+fn frontmost_app_name() -> Option<String> {
+    use objc2_app_kit::NSWorkspace;
+    let app = NSWorkspace::sharedWorkspace().frontmostApplication()?;
+    app.localizedName().map(|n| n.to_string())
+}
+
+/// Run an AppleScript in-process via `NSAppleScript`, returning its string
+/// result. Replaces `osascript -e <script>` — same Apple-event IPC, but no
+/// fork/exec/Gatekeeper of an `osascript` subprocess.
+fn run_applescript(script: &str) -> Option<String> {
+    use objc2::AnyThread;
+    use objc2_foundation::{NSAppleScript, NSString};
+    let source = NSString::from_str(script);
+    let script = NSAppleScript::initWithSource(NSAppleScript::alloc(), &source)?;
+    let mut err = None;
+    // SAFETY: `err` is the documented `Option<Retained<NSDictionary>>`
+    // out-param type. Our scripts wrap their body in `try`, so this returns a
+    // valid (possibly empty-string) descriptor rather than nil.
+    let desc = unsafe { script.executeAndReturnError(Some(&mut err)) };
+    if err.is_some() {
         return None;
     }
-    String::from_utf8(out.stdout).ok().map(|s| s.trim().into())
+    desc.stringValue().map(|s| s.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -146,16 +157,16 @@ fn log_line(
 }
 
 fn format_local_time(epoch: i64) -> String {
-    if let Ok(out) = Command::new("date")
-        .args(["-r", &epoch.to_string(), "+%Y-%m-%dT%H:%M:%S"])
-        .output()
-    {
-        if out.status.success() {
-            return String::from_utf8(out.stdout)
-                .unwrap_or_default()
-                .trim()
-                .into();
-        }
+    match crate::cache::local_tm(epoch) {
+        Some(tm) => format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec,
+        ),
+        None => epoch.to_string(),
     }
-    epoch.to_string()
 }

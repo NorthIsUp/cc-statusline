@@ -67,13 +67,18 @@ pub fn reset_str(reset: i64) -> String {
             format!("{days}d")
         };
     }
-    // <24h: show clock time + duration remaining.
-    let clock = std::process::Command::new("date")
-        .args(["-r", &reset.to_string(), "+%l:%M%p"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().replace("AM", "a").replace("PM", "p"))
+    // <24h: show clock time + duration remaining. Formats `H:MMa`/`H:MMp`
+    // in local time (was `date -r <reset> +%l:%M%p`).
+    let clock = crate::cache::local_tm(reset)
+        .map(|tm| {
+            let (h12, ap) = match tm.tm_hour {
+                0 => (12, "a"),
+                h @ 1..=11 => (h, "a"),
+                12 => (12, "p"),
+                h => (h - 12, "p"),
+            };
+            format!("{h12}:{:02}{ap}", tm.tm_min)
+        })
         .unwrap_or_default();
     remaining = (remaining + 59) / 60 * 60;
     let hrs = remaining / 3_600;

@@ -65,6 +65,37 @@ pub fn maybe_spawn_stack(session_id: &str, cwd: &str, st: &state::State) {
     spawn_self(&["--refresh-stack", session_id], &[(ENV_STACK_CWD, cwd)]);
 }
 
+/// `(owner, name, branch)` for the repo at `cwd` — the inputs `gh pr view`
+/// derived implicitly from the origin remote and the checked-out branch.
+/// `None` on a detached HEAD, a missing/non-GitHub origin, or no repo.
+fn repo_identity(cwd: &str) -> Option<(String, String, String)> {
+    let repo = git2::Repository::discover(cwd).ok()?;
+    let head = repo.head().ok()?;
+    if !head.is_branch() {
+        return None;
+    }
+    let branch = head.shorthand().ok()?.to_string();
+    let remote = repo.find_remote("origin").ok()?;
+    let (owner, name) = parse_remote(remote.url().ok()?)?;
+    Some((owner, name, branch))
+}
+
+/// Extract `(owner, name)` from a github.com remote URL in any of the common
+/// forms (scp-style, https, ssh). Non-github.com hosts return `None`.
+fn parse_remote(url: &str) -> Option<(String, String)> {
+    let rest = url
+        .strip_prefix("git@github.com:")
+        .or_else(|| url.strip_prefix("https://github.com/"))
+        .or_else(|| url.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| url.strip_prefix("git://github.com/"))?;
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let (owner, name) = rest.split_once('/')?;
+    if owner.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some((owner.to_string(), name.to_string()))
+}
+
 fn spawn_self(args: &[&str], envs: &[(&str, &str)]) {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -99,28 +130,13 @@ pub fn run_refresh_pr(session_id: &str) {
     handle.state.pr.locked_at = now_epoch();
     let _ = handle.save();
 
-    let body = match Command::new("gh")
-        .args([
-            "pr",
-            "view",
-            "--json",
-            "state,isDraft,reviewDecision,comments,statusCheckRollup,url,number",
-        ])
-        .current_dir(&cwd)
-        // Force gh's keychain credential, not whatever stale GITHUB_TOKEN
-        // might be in the environment. The user's shell often exports a
-        // narrow-scope token from another tool; unset it so gh uses the
-        // properly-authed keychain identity.
-        .env_remove("GITHUB_TOKEN")
-        .env_remove("GH_TOKEN")
-        .stderr(Stdio::null())
-        .output()
-    {
-        Ok(o) if o.status.success() && !o.stdout.is_empty() => {
-            String::from_utf8(o.stdout).unwrap_or_default()
-        }
-        _ => "{}".into(),
-    };
+    // The PR for the current branch, fetched directly from GitHub's GraphQL
+    // API (was `gh pr view --json …`). `repo_identity` recovers the
+    // owner/name/branch that gh inferred implicitly from cwd; auth is the
+    // `GH_TOKEN`/`GITHUB_TOKEN` env var (see `github::token`).
+    let body = repo_identity(&cwd)
+        .and_then(|(owner, name, branch)| crate::github::pr_view_json(&owner, &name, &branch))
+        .unwrap_or_else(|| "{}".into());
 
     handle.state.pr.json = body;
     handle.state.pr.fetched_at = now_epoch();
@@ -145,11 +161,13 @@ pub fn run_refresh_other(session_id: &str) {
     handle.state.other_prs.locked_at = now_epoch();
     let _ = handle.save();
 
-    // PRs *created* by this session only. Cross-repo bleed is impossible at
-    // this layer because cc-thread-prs only emits a URL when a tool_use in
-    // the transcript actually created a PR.
+    // All PRs referenced in the transcript (created + linked). `--all`
+    // also captures PRs created out-of-band (e.g. via Graphite `gt`) that
+    // the create-mode detector misses, and PRs the conversation touched
+    // without creating. The chips component handles the larger set with
+    // its `×N` collapse summary.
     if let Ok(out) = Command::new(&helper)
-        .args(["--urls-only", "--transcript", &transcript])
+        .args(["--urls-only", "--all", "--transcript", &transcript])
         .stderr(Stdio::null())
         .output()
     {
@@ -163,10 +181,19 @@ pub fn run_refresh_other(session_id: &str) {
         // Detect newly-created PRs in this session and force-refresh the
         // global recent_prs cache so the chip lights up with state color
         // immediately, instead of waiting up to `recent_prs_ttl` seconds.
-        let prev: std::collections::HashSet<&String> = handle.state.other_prs.urls.iter().collect();
+        let prev: std::collections::HashSet<String> =
+            handle.state.other_prs.urls.iter().cloned().collect();
         let has_new = new_urls.iter().any(|u| !prev.contains(u));
 
-        handle.state.other_prs.urls = new_urls;
+        // Union: keep all previously-seen URLs (so /compact rewriting the
+        // transcript doesn't drop chip history) and append any new ones in
+        // discovery order. Chips never age out — the chips component
+        // collapses to a `×N` summary when there are too many to render.
+        for u in new_urls {
+            if !prev.contains(&u) {
+                handle.state.other_prs.urls.push(u);
+            }
+        }
         handle.state.other_prs.fetched_at = now_epoch();
 
         if has_new {
@@ -323,19 +350,9 @@ fn fetch_other_states(urls: &[String]) -> String {
     }
     query.push('}');
 
-    let out = Command::new("gh")
-        .args(["api", "graphql", "-f", &format!("query={query}")])
-        .env_remove("GITHUB_TOKEN")
-        .env_remove("GH_TOKEN")
-        .stderr(Stdio::null())
-        .output();
-    let body = match out {
-        Ok(o) if o.status.success() && !o.stdout.is_empty() => o.stdout,
-        _ => return "{}".into(),
-    };
-    let v: serde_json::Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(_) => return "{}".into(),
+    let v = match crate::github::graphql(&query) {
+        Some(v) => v,
+        None => return "{}".into(),
     };
     let data = match v.get("data") {
         Some(d) => d,

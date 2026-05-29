@@ -39,6 +39,10 @@ pub struct PrEntry {
     /// the timestamp could not be parsed (defensive: treat unknown as
     /// "do not collapse" rather than dropping).
     pub merged_at: Option<i64>,
+    /// True iff GitHub's `autoMergeRequest` is non-null — i.e. the PR is
+    /// queued to auto-merge when checks pass.
+    #[serde(default)]
+    pub auto_merge: bool,
 }
 
 impl RecentPrs {
@@ -236,22 +240,12 @@ fn fetch_chunk(chunk: &[(String, (String, String, u64))]) -> Option<HashMap<Stri
             continue;
         }
         q.push_str(&format!(
-            "  a{i}: repository(owner: \"{owner}\", name: \"{repo}\") {{ pullRequest(number: {number}) {{ url state isDraft number mergedAt }} }}\n"
+            "  a{i}: repository(owner: \"{owner}\", name: \"{repo}\") {{ pullRequest(number: {number}) {{ url state isDraft number mergedAt autoMergeRequest {{ __typename }} }} }}\n"
         ));
     }
     q.push_str("}\n");
 
-    let out = Command::new("gh")
-        .args(["api", "graphql", "-f", &format!("query={q}")])
-        .env_remove("GITHUB_TOKEN")
-        .env_remove("GH_TOKEN")
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if out.stdout.is_empty() {
-        return None;
-    }
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let v = crate::github::graphql(&q)?;
     let data = v.get("data")?.as_object()?;
     let mut map = HashMap::new();
     for (_alias, val) in data {
@@ -274,6 +268,10 @@ fn fetch_chunk(chunk: &[(String, (String, String, u64))]) -> Option<HashMap<Stri
             .get("mergedAt")
             .and_then(|x| x.as_str())
             .and_then(crate::input::ts_to_epoch);
+        let auto_merge = pr
+            .get("autoMergeRequest")
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
         map.insert(
             url,
             PrEntry {
@@ -281,6 +279,7 @@ fn fetch_chunk(chunk: &[(String, (String, String, u64))]) -> Option<HashMap<Stri
                 is_draft,
                 number,
                 merged_at,
+                auto_merge,
             },
         );
     }
@@ -332,23 +331,13 @@ mod tests {
 const QUERY: &str = r#"query {
   viewer {
     pullRequests(first: 100, orderBy: {field: UPDATED_AT, direction: DESC}, states: [OPEN, MERGED, CLOSED]) {
-      nodes { url state isDraft number mergedAt }
+      nodes { url state isDraft number mergedAt autoMergeRequest { __typename } }
     }
   }
 }"#;
 
 fn fetch() -> Option<HashMap<String, PrEntry>> {
-    let out = Command::new("gh")
-        .args(["api", "graphql", "-f", &format!("query={QUERY}")])
-        .env_remove("GITHUB_TOKEN")
-        .env_remove("GH_TOKEN")
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() || out.stdout.is_empty() {
-        return None;
-    }
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let v = crate::github::graphql(QUERY)?;
     let nodes = v
         .get("data")?
         .get("viewer")?
@@ -369,6 +358,10 @@ fn fetch() -> Option<HashMap<String, PrEntry>> {
             .get("mergedAt")
             .and_then(|x| x.as_str())
             .and_then(crate::input::ts_to_epoch);
+        let auto_merge = n
+            .get("autoMergeRequest")
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
         map.insert(
             url,
             PrEntry {
@@ -376,6 +369,7 @@ fn fetch() -> Option<HashMap<String, PrEntry>> {
                 is_draft,
                 number,
                 merged_at,
+                auto_merge,
             },
         );
     }

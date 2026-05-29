@@ -91,6 +91,18 @@ pub fn render(ctx: &RenderCtx, state: &mut State, cols: u32) -> String {
         None
     };
 
+    // When the overflow row is emitted, the compact `×N` chips on line 1 is
+    // a redundant placeholder for the same chain. Zero its rendered text so
+    // line 1 doesn't carry the duplicate. Width stays as the layout engine
+    // computed it — we don't re-pack — to keep right-edge alignment stable.
+    if line2.is_some() {
+        for it in left_items.iter_mut().chain(right_items.iter_mut()) {
+            if it.name == "chips" && !it.dropped {
+                it.rendered = crate::component::Rendered::empty();
+            }
+        }
+    }
+
     let left = join_items(&left_items);
     let right = join_items(&right_items);
     let llen = vlen(&left);
@@ -133,20 +145,24 @@ fn compute_chips_overflow(
     }
     let current_w = chips.rendered.width;
     // Try the largest size first, falling back to smaller-but-still-larger
-    // sizes if the expanded form doesn't fit terminal width.
+    // sizes if a larger expansion isn't actually wider. We deliberately do
+    // not gate on cols — if the chain is too wide for the terminal, let it
+    // wrap rather than hiding the whole line.
     let mut candidate: Option<crate::component::Rendered> = None;
     for s in chips.sizes.iter().rev().copied() {
         if s <= chips.size {
             break;
         }
         let r = components::render_named(&chips.name, s, ctx).unwrap_or_default();
-        if r.width > current_w && r.width <= cols {
+        if r.width > current_w {
             candidate = Some(r);
             break;
         }
     }
     let r = candidate?;
     // Right-pad to `cols` cells so the right-edge invariant matches line 1.
+    // Skip padding when the line would already overflow cols (terminal will
+    // soft-wrap on its own).
     let pad = cols.saturating_sub(r.width) as usize;
     let mut out = r.text;
     if pad > 0 {
@@ -991,5 +1007,42 @@ mod tests {
                 "line 2 right-padded to cols"
             );
         }
+    }
+
+    /// When the overflow row is emitted, the compact `×N` chips placeholder
+    /// must NOT also appear on line 1 — that would double-render the same
+    /// chain (one collapsed, one expanded).
+    #[test]
+    fn render_no_compact_chips_on_line1_when_overflow_emitted() {
+        unsafe {
+            std::env::set_var("CC_STATUSLINE_NF_WIDTH", "1");
+            std::env::set_var("CC_STATUSLINE_SAFETY_MARGIN", "0");
+        }
+        let git = mk_git();
+        let other = chips_other((101..=160).collect());
+        let burn = crate::transcript::BurnInfo::default();
+        let agents = AgentCount::default();
+        let cols: u32 = 80;
+        let session = mk_session(cols);
+        let ctx = RenderCtx {
+            session: &session,
+            git: &git,
+            other: &other,
+            burn: &burn,
+            agents: &agents,
+            tick: 0,
+        };
+        let mut state = State::default();
+        let line = render(&ctx, &mut state, cols);
+        let mut iter = line.lines();
+        let first = crate::vlen::strip(iter.next().unwrap_or(""));
+        let second = iter.next().expect("overflow row emitted");
+        // Line 2 carries the expanded chain.
+        assert!(second.contains("#101"), "chain on line 2: {second:?}");
+        // Line 1 must not contain the compact `×N` chip count for the chain.
+        assert!(
+            !first.contains(&format!("×{}", other.urls.len())),
+            "compact ×N chip leaked onto line 1: {first:?}"
+        );
     }
 }

@@ -27,13 +27,17 @@
     clippy::manual_range_contains
 )]
 
-use cc_statusline::{focus, git, input, recent_prs, refresh, render, state, transcript};
+use cc_statusline::{components, focus, git, input, recent_prs, refresh, render, state, transcript};
 use std::io::{self, Read};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 2 && args[1] == "--refresh-recent-prs" {
         recent_prs::run_refresh();
+        return;
+    }
+    if args.len() >= 2 && args[1] == "--preview" {
+        preview_all();
         return;
     }
     if args.len() >= 3 {
@@ -54,6 +58,79 @@ fn main() {
         }
     }
     render_once();
+}
+
+/// Print every registered component at every size it offers, using live
+/// data gathered from the current working directory (and whatever session
+/// JSON the caller pipes in on stdin, if any). Useful for visually
+/// auditing how each component shrinks across `xs → xl`.
+fn preview_all() {
+    use cc_statusline::component::RenderCtx;
+    use std::io::IsTerminal;
+
+    // If stdin has JSON, parse it; otherwise synthesize a minimal session
+    // rooted at the cwd. We intentionally keep both paths going through the
+    // same `Session::parse` so output reflects production behavior.
+    let mut buf = String::new();
+    if !io::stdin().is_terminal() {
+        let _ = io::stdin().read_to_string(&mut buf);
+    }
+    if buf.trim().is_empty() {
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        buf = format!(
+            r#"{{"session_id":"preview","model":{{"display_name":"Opus 4.7"}},"workspace":{{"current_dir":"{cwd}"}},"transcript_path":""}}"#
+        );
+    }
+    let session = input::Session::parse(&buf);
+    let st = state::State::load(&session.session_id);
+    let git = git::view(&session, &st);
+    let other = transcript::other_prs_view(&st, &git.origin_url);
+    let burn = transcript::BurnInfo::default();
+    let agents = transcript::AgentCount::default();
+    let ctx = RenderCtx {
+        session: &session,
+        git: &git,
+        other: &other,
+        burn: &burn,
+        agents: &agents,
+        tick: 0,
+    };
+
+    let name_w = components::ALL_NAMES
+        .iter()
+        .map(|n| n.len())
+        .max()
+        .unwrap_or(10);
+
+    println!("\x1b[1mcc-statusline component preview\x1b[0m  ({} components)", components::ALL_NAMES.len());
+    println!();
+    for &name in components::ALL_NAMES {
+        let sizes = components::sizes_for(name).unwrap_or(&[]);
+        let default = components::default_size_for(name);
+        for &size in sizes {
+            let r = components::render_named(name, size, &ctx).unwrap_or_default();
+            let marker = if Some(size) == default { "*" } else { " " };
+            let body = if r.text.is_empty() {
+                "\x1b[2m(empty)\x1b[0m".to_string()
+            } else {
+                r.text.clone()
+            };
+            println!(
+                "{name:<nw$}  {marker}{sz:<2}  {w:>3}w  {body}",
+                name = name,
+                marker = marker,
+                sz = size.as_str(),
+                w = r.width,
+                body = body,
+                nw = name_w,
+            );
+        }
+        println!();
+    }
+    println!("\x1b[2m* = default size · widths are visible-column counts\x1b[0m");
 }
 
 fn render_once() {

@@ -5,7 +5,6 @@ use crate::input::Session;
 use crate::state::State;
 use serde::Deserialize;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -20,6 +19,16 @@ pub struct PrJson {
     pub status_check_rollup: Vec<CheckRow>,
     pub url: String,
     pub number: Option<u64>,
+    /// Non-null iff automerge is enabled on the PR. We only care about
+    /// presence/absence, so any JSON value is accepted.
+    #[serde(rename = "autoMergeRequest")]
+    pub auto_merge_request: Option<serde_json::Value>,
+}
+
+impl PrJson {
+    pub fn auto_merge(&self) -> bool {
+        self.auto_merge_request.is_some()
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -77,66 +86,49 @@ impl GitData {
     }
 }
 
-fn git_in(cwd: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8(out.stdout).ok().map(|s| s.trim().into())
-}
-
 pub fn view(session: &Session, st: &State) -> GitData {
     let mut g = GitData::default();
     if session.cwd.is_empty() {
         return g;
     }
-    if git_in(&session.cwd, &["rev-parse", "--git-dir"]).is_none() {
-        return g;
-    }
+    // Discover the repo from cwd upward (equivalent to `git rev-parse`'s
+    // discovery). Not a repo → empty GitData, same as before.
+    let repo = match git2::Repository::discover(&session.cwd) {
+        Ok(r) => r,
+        Err(_) => return g,
+    };
+
+    // Repo dirs. `path()` is the gitdir (`.git/worktrees/<n>` in a linked
+    // worktree), `commondir()` the shared `.git`, `workdir()` the toplevel —
+    // these feed worktree detection in `components::worktree_suffix`.
+    g.git_dir = Some(repo.path().to_path_buf());
+    g.common_dir = Some(repo.commondir().to_path_buf());
+    g.toplevel = repo.workdir().map(PathBuf::from);
+
+    // Current branch. `--show-current` is empty on a detached HEAD; mirror
+    // that by only taking the shorthand when HEAD points at a branch.
     g.branch = if !session.wt_branch.is_empty() {
         session.wt_branch.clone()
     } else {
-        git_in(&session.cwd, &["branch", "--show-current"]).unwrap_or_default()
+        repo.head()
+            .ok()
+            .filter(|h| h.is_branch())
+            .and_then(|h| h.shorthand().ok().map(String::from))
+            .unwrap_or_default()
     };
-    g.origin_url =
-        git_in(&session.cwd, &["config", "--get", "remote.origin.url"]).unwrap_or_default();
-    if let Some(s) = git_in(&session.cwd, &["rev-parse", "--git-dir"]) {
-        g.git_dir = Some(absolutize(&session.cwd, &s));
-    }
-    if let Some(s) = git_in(&session.cwd, &["rev-parse", "--git-common-dir"]) {
-        g.common_dir = Some(absolutize(&session.cwd, &s));
-    }
-    if let Some(s) = git_in(&session.cwd, &["rev-parse", "--show-toplevel"]) {
-        g.toplevel = Some(PathBuf::from(s));
+
+    g.origin_url = repo
+        .find_remote("origin")
+        .ok()
+        .and_then(|r| r.url().ok().map(String::from))
+        .unwrap_or_default();
+
+    if let Some((ahead, behind)) = ahead_behind(&repo) {
+        g.ahead = ahead;
+        g.behind = behind;
     }
 
-    if let Ok(out) = Command::new("git")
-        .args(["status", "--porcelain=v2", "-b"])
-        .current_dir(&session.cwd)
-        .stderr(Stdio::null())
-        .output()
-    {
-        if let Ok(text) = String::from_utf8(out.stdout) {
-            for line in text.lines() {
-                if let Some(rest) = line.strip_prefix("# branch.ab ") {
-                    let mut it = rest.split_whitespace();
-                    if let (Some(a), Some(b)) = (it.next(), it.next()) {
-                        g.ahead = a.trim_start_matches('+').parse().unwrap_or(0);
-                        g.behind = b.trim_start_matches('-').parse().unwrap_or(0);
-                    }
-                } else if line.starts_with('#') || line.is_empty() {
-                    // skip
-                } else {
-                    g.dirty += 1;
-                }
-            }
-        }
-    }
+    g.dirty = dirty_count(&repo);
 
     if !st.pr.json.is_empty() {
         if let Ok(parsed) = serde_json::from_str::<PrJson>(&st.pr.json) {
@@ -146,13 +138,34 @@ pub fn view(session: &Session, st: &State) -> GitData {
     g
 }
 
-fn absolutize(cwd: &str, p: &str) -> PathBuf {
-    let path = std::path::Path::new(p);
-    if path.is_absolute() {
-        path.into()
-    } else {
-        std::path::Path::new(cwd).join(path)
+/// Commits ahead/behind the upstream tracking branch — the `branch.ab`
+/// line of `git status -b`. `None` when detached or no upstream is set.
+fn ahead_behind(repo: &git2::Repository) -> Option<(u32, u32)> {
+    let head = repo.head().ok()?;
+    if !head.is_branch() {
+        return None;
     }
+    let local_oid = head.target()?;
+    let local = repo
+        .find_branch(head.shorthand().ok()?, git2::BranchType::Local)
+        .ok()?;
+    let upstream_oid = local.upstream().ok()?.get().target()?;
+    let (ahead, behind) = repo.graph_ahead_behind(local_oid, upstream_oid).ok()?;
+    Some((ahead as u32, behind as u32))
+}
+
+/// Count of changed paths — the non-header lines of `git status --porcelain`.
+/// Untracked files count (`recurse_untracked_dirs(false)` matches git's
+/// default of collapsing a wholly-untracked dir to one entry); ignored
+/// files do not.
+fn dirty_count(repo: &git2::Repository) -> u32 {
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(false)
+        .include_ignored(false);
+    repo.statuses(Some(&mut opts))
+        .map(|s| s.len() as u32)
+        .unwrap_or(0)
 }
 
 pub fn extract_ticket(branch: &str) -> Option<String> {

@@ -52,6 +52,8 @@ pub struct PrStateLite {
     pub is_draft: bool,
     /// Unix epoch seconds the PR was merged, or `None` if open/closed/unknown.
     pub merged_at: Option<i64>,
+    /// True iff GitHub's automerge is queued for this PR.
+    pub auto_merge: bool,
 }
 
 pub fn other_prs_view(st: &State, origin_url: &str) -> OtherPrs {
@@ -76,6 +78,7 @@ pub fn other_prs_view(st: &State, origin_url: &str) -> OtherPrs {
                     state: entry.state.clone(),
                     is_draft: entry.is_draft,
                     merged_at: entry.merged_at,
+                    auto_merge: entry.auto_merge,
                 },
             );
         }

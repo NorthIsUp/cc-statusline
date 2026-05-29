@@ -17,6 +17,7 @@ pub mod components;
 pub mod config;
 pub mod focus;
 pub mod git;
+pub mod github;
 pub mod glyphs;
 pub mod input;
 pub mod layout;

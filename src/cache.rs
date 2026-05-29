@@ -14,6 +14,18 @@ pub fn now_epoch() -> i64 {
         .unwrap_or(0)
 }
 
+/// Broken-down local time for a unix `epoch` via `localtime_r` (reads the
+/// system timezone). Replaces shelling out to `date -r`.
+pub fn local_tm(epoch: i64) -> Option<libc::tm> {
+    let t = epoch as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        None
+    } else {
+        Some(tm)
+    }
+}
+
 pub fn mtime(p: &Path) -> Option<i64> {
     let md = std::fs::metadata(p).ok()?;
     md.modified()
