@@ -151,54 +151,36 @@ pub fn run_refresh_other(session_id: &str) {
         Err(_) => return,
     };
 
-    let helper = format!(
-        "{}/my/bin/cc-thread-prs",
-        std::env::var("HOME").unwrap_or_default()
-    );
-    if !std::path::Path::new(&helper).exists() {
-        return;
-    }
     handle.state.other_prs.locked_at = now_epoch();
     let _ = handle.save();
 
-    // All PRs referenced in the transcript (created + linked). `--all`
-    // also captures PRs created out-of-band (e.g. via Graphite `gt`) that
-    // the create-mode detector misses, and PRs the conversation touched
-    // without creating. The chips component handles the larger set with
-    // its `×N` collapse summary.
-    if let Ok(out) = Command::new(&helper)
-        .args(["--urls-only", "--all", "--transcript", &transcript])
-        .stderr(Stdio::null())
-        .output()
-    {
-        let new_urls: Vec<String> = String::from_utf8(out.stdout)
-            .unwrap_or_default()
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(|l| l.to_string())
-            .collect();
+    // All PR URLs referenced in the transcript (created + linked), scanned
+    // in-process — the equivalent of `cc-thread-prs --urls-only --all`. This
+    // captures PRs created out-of-band (e.g. via Graphite `gt`) and ones the
+    // conversation merely touched. The chips component collapses a large set
+    // to a `×N` summary.
+    let new_urls = crate::transcript::pr_urls_in_transcript(&transcript);
 
-        // Detect newly-created PRs in this session and force-refresh the
-        // global recent_prs cache so the chip lights up with state color
-        // immediately, instead of waiting up to `recent_prs_ttl` seconds.
-        let prev: std::collections::HashSet<String> =
-            handle.state.other_prs.urls.iter().cloned().collect();
-        let has_new = new_urls.iter().any(|u| !prev.contains(u));
+    // Detect newly-created PRs in this session and force-refresh the global
+    // recent_prs cache so the chip lights up with state color immediately,
+    // instead of waiting up to `recent_prs_ttl` seconds.
+    let prev: std::collections::HashSet<String> =
+        handle.state.other_prs.urls.iter().cloned().collect();
+    let has_new = new_urls.iter().any(|u| !prev.contains(u));
 
-        // Union: keep all previously-seen URLs (so /compact rewriting the
-        // transcript doesn't drop chip history) and append any new ones in
-        // discovery order. Chips never age out — the chips component
-        // collapses to a `×N` summary when there are too many to render.
-        for u in new_urls {
-            if !prev.contains(&u) {
-                handle.state.other_prs.urls.push(u);
-            }
+    // Union: keep all previously-seen URLs (so /compact rewriting the
+    // transcript doesn't drop chip history) and append any new ones in
+    // discovery order. Chips never age out — the chips component collapses
+    // to a `×N` summary when there are too many to render.
+    for u in new_urls {
+        if !prev.contains(&u) {
+            handle.state.other_prs.urls.push(u);
         }
-        handle.state.other_prs.fetched_at = now_epoch();
+    }
+    handle.state.other_prs.fetched_at = now_epoch();
 
-        if has_new {
-            invalidate_recent_prs();
-        }
+    if has_new {
+        invalidate_recent_prs();
     }
 
     // States are now hydrated from the global recent_prs cache, which is

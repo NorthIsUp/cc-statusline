@@ -10,6 +10,53 @@ use crate::state::State;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::OnceLock;
+
+/// Every PR URL referenced anywhere in the transcript at `path`, with
+/// Graphite PR links (`app.graphite.com/github/pr/O/R/N`) normalised to the
+/// canonical `github.com/O/R/pull/N` form, deduped in first-appearance order.
+///
+/// In-process equivalent of `cc-thread-prs --urls-only --all`: in that mode
+/// the helper's output reduces to "all PR URLs in the transcript" (its
+/// creation-signal set is always a subset of the full scan), so this plain
+/// scan is exact — verified byte-for-byte against the script.
+pub fn pr_urls_in_transcript(path: &str) -> Vec<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => scan_pr_urls(&text),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn scan_pr_urls(text: &str) -> Vec<String> {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r"https://(?:github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[0-9]+|app\.graphite\.com/github/pr/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/[0-9]+)",
+        )
+        .expect("static PR-URL regex is valid")
+    });
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for m in re.find_iter(text) {
+        let url = normalize_graphite_pr_url(m.as_str());
+        if seen.insert(url.clone()) {
+            out.push(url);
+        }
+    }
+    out
+}
+
+/// `app.graphite.com/github/pr/OWNER/REPO/N` → `github.com/OWNER/REPO/pull/N`;
+/// already-canonical github URLs pass through unchanged.
+fn normalize_graphite_pr_url(url: &str) -> String {
+    if let Some(rest) = url.strip_prefix("https://app.graphite.com/github/pr/") {
+        let p: Vec<&str> = rest.split('/').collect();
+        if p.len() == 3 {
+            return format!("https://github.com/{}/{}/pull/{}", p[0], p[1], p[2]);
+        }
+    }
+    url.to_string()
+}
 
 fn url_repo(url: &str) -> Option<String> {
     url.strip_prefix("https://github.com/")
@@ -221,4 +268,31 @@ fn compute_agents(path: &str) -> (u32, u32) {
         }
     }
     (open.len() as u32, total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_pr_urls_dedups_normalizes_and_ignores_non_prs() {
+        let text = r#"
+            opened https://github.com/o/r/pull/12 then mentioned
+            https://github.com/o/r/pull/12 again; a graphite link
+            https://app.graphite.com/github/pr/team/repo/345 ; and ignore
+            https://github.com/o/r/issues/9 plus https://github.com/o/r (no pull).
+        "#;
+        assert_eq!(
+            scan_pr_urls(text),
+            vec![
+                "https://github.com/o/r/pull/12".to_string(),
+                "https://github.com/team/repo/pull/345".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_pr_urls_empty_when_none() {
+        assert!(scan_pr_urls("no links here").is_empty());
+    }
 }
