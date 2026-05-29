@@ -116,7 +116,9 @@ fn run_applescript(script: &str) -> Option<String> {
     if err.is_some() {
         return None;
     }
-    desc.stringValue().map(|s| s.to_string())
+    // Trim to match the old `osascript` helper, whose stdout carried a
+    // trailing newline that was stripped before comparison.
+    desc.stringValue().map(|s| s.to_string().trim().to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
