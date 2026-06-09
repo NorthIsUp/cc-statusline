@@ -134,13 +134,36 @@ pub fn run_refresh_pr(session_id: &str) {
     // API (was `gh pr view --json …`). `repo_identity` recovers the
     // owner/name/branch that gh inferred implicitly from cwd; auth is the
     // `GH_TOKEN`/`GITHUB_TOKEN` env var (see `github::token`).
-    let body = repo_identity(&cwd)
-        .and_then(|(owner, name, branch)| crate::github::pr_view_json(&owner, &name, &branch))
-        .unwrap_or_else(|| "{}".into());
+    //
+    // Two outcomes are "success" and one is "failure", and they must not be
+    // conflated:
+    //   - no repo / detached HEAD / non-GitHub origin → no PR context exists,
+    //     so cache an empty `"{}"` as fresh (the chip correctly shows nothing).
+    //   - `Some(json)` → a real PR (or a definitive "branch has no PR" `"{}"`);
+    //     cache it as fresh.
+    //   - `None` → the fetch itself failed (rate limit, network, missing
+    //     token). DON'T overwrite the last-known-good json and DON'T advance
+    //     `fetched_at` — otherwise a transient failure blanks the chip and
+    //     freezes that blank as "fresh" for a whole TTL, so it never recovers.
+    //     Instead keep the previous state and stamp `locked_at` as a short
+    //     retry backoff (`ttl.max(10)`s) so the next render re-attempts soon
+    //     without hammering the API every tick.
+    let fetched = match repo_identity(&cwd) {
+        Some((owner, name, branch)) => crate::github::pr_view_json(&owner, &name, &branch),
+        None => Some("{}".into()), // no PR context → definitive empty
+    };
 
-    handle.state.pr.json = body;
-    handle.state.pr.fetched_at = now_epoch();
-    handle.state.pr.locked_at = 0;
+    match fetched {
+        Some(body) => {
+            handle.state.pr.json = body;
+            handle.state.pr.fetched_at = now_epoch();
+            handle.state.pr.locked_at = 0;
+        }
+        None => {
+            // Preserve last-known-good json; leave fetched_at stale so we retry.
+            handle.state.pr.locked_at = now_epoch();
+        }
+    }
     let _ = handle.save();
 }
 
