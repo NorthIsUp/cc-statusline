@@ -177,19 +177,40 @@ pub fn run_refresh() {
     }
 }
 
-/// A session state file older than this (by mtime) is treated as a dead
-/// session: nobody is viewing its chips, so we neither hydrate its URLs nor let
-/// them grow the global fetch, and we delete it. Without this, dead sessions
-/// accumulate indefinitely (hundreds observed) and every global refresh
-/// re-fetches all their PRs by URL — tens of extra GraphQL queries per cycle,
-/// enough on its own to exhaust the 5000/hr budget.
+/// A session file not rewritten within this window is *inactive*. A displayed
+/// session rewrites its state file on every render (~1s cadence), so 1h is a
+/// wide safety margin. Inactive sessions are ignored when hydrating chips —
+/// nobody's viewing them, so refreshing their PR state just burns API budget —
+/// even though the file is left on disk until it ages out.
+const ACTIVE_SESSION_SECS: i64 = 60 * 60;
+
+/// A session file older than this is a *dead* session and is deleted outright.
+/// Kept longer than `ACTIVE_SESSION_SECS` so a session resumed within the day
+/// still finds its chip-URL history, without us paying to refresh it while idle.
+/// Without this, dead sessions accumulate indefinitely (hundreds observed).
 const STALE_SESSION_SECS: i64 = 24 * 60 * 60;
 
-/// Walks every *live* session state TOML in `cache_dir()` (excluding
+enum SessionAge {
+    Active, // touched within the hour: a live viewer — refresh its chips
+    Idle,   // 1h–24h: keep the file, but don't spend API refreshing it
+    Dead,   // >24h: delete
+}
+
+fn classify_age(age_secs: i64) -> SessionAge {
+    if age_secs > STALE_SESSION_SECS {
+        SessionAge::Dead
+    } else if age_secs > ACTIVE_SESSION_SECS {
+        SessionAge::Idle
+    } else {
+        SessionAge::Active
+    }
+}
+
+/// Walks every *active* session state TOML in `cache_dir()` (excluding
 /// `recent_prs.toml` itself) and returns the union of `other_prs.urls` entries
-/// that are missing from `have`. Files whose mtime is older than
-/// `STALE_SESSION_SECS` are skipped and deleted — a dead session's chips have
-/// no viewer, so refreshing them just burns API budget.
+/// that are missing from `have`. Sessions idle >1h are ignored (no live viewer
+/// to serve); dead sessions >24h are additionally deleted. Either way their
+/// chips don't drive a fetch — that fan-out is what exhausts the 5000/hr budget.
 fn collect_missing_urls(have: &HashMap<String, PrEntry>) -> Vec<String> {
     let dir = config::cache_dir();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -205,10 +226,18 @@ fn collect_missing_urls(have: &HashMap<String, PrEntry>) -> Vec<String> {
         if path.file_name().and_then(|s| s.to_str()) == Some("recent_prs.toml") {
             continue;
         }
-        // Prune dead sessions: skip (and remove) files not touched recently.
-        if crate::cache::mtime(&path).is_some_and(|m| now_epoch() - m > STALE_SESSION_SECS) {
-            let _ = std::fs::remove_file(&path);
-            continue;
+        // Ignore inactive sessions (no live viewer); delete truly dead ones.
+        let mtime = match crate::cache::mtime(&path) {
+            Some(m) => m,
+            None => continue,
+        };
+        match classify_age(now_epoch() - mtime) {
+            SessionAge::Dead => {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            SessionAge::Idle => continue,
+            SessionAge::Active => {}
         }
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
@@ -362,6 +391,15 @@ mod tests {
         assert_eq!(adaptive_ttl(500, 20), 60);
         assert_eq!(adaptive_ttl(499, 20), 300);
         assert_eq!(adaptive_ttl(1, 20), 300);
+    }
+
+    #[test]
+    fn classify_age_windows() {
+        assert!(matches!(classify_age(0), SessionAge::Active));
+        assert!(matches!(classify_age(ACTIVE_SESSION_SECS), SessionAge::Active));
+        assert!(matches!(classify_age(ACTIVE_SESSION_SECS + 1), SessionAge::Idle));
+        assert!(matches!(classify_age(STALE_SESSION_SECS), SessionAge::Idle));
+        assert!(matches!(classify_age(STALE_SESSION_SECS + 1), SessionAge::Dead));
     }
 
     #[test]
