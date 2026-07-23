@@ -10,6 +10,7 @@
 use crate::cache::now_epoch;
 use crate::config;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io;
@@ -24,9 +25,26 @@ pub struct RecentPrs {
     pub version: String,
     pub fetched_at: i64,
     pub locked_at: i64,
+    /// Last-observed GitHub GraphQL `rateLimit.remaining` (of 5000/hr). Drives
+    /// adaptive refresh spacing: the closer to exhaustion, the longer every
+    /// session waits before refreshing. `0` means "never observed" (a fresh
+    /// cache or a failed fetch) and is treated as healthy — the failure path's
+    /// `locked_at` backoff covers a hard rate-limit separately.
+    pub rate_remaining: i64,
     /// Map url -> {state, isDraft}. Stored as serde_json::Value-ish so we
     /// don't need a fixed schema in TOML.
     pub prs: HashMap<String, PrEntry>,
+}
+
+/// Adaptive refresh interval from the last-seen rate-limit headroom: the fewer
+/// GraphQL points left, the longer we space out refreshes (across every
+/// session, since they share this cache). `remaining == 0` = unknown/healthy.
+fn adaptive_ttl(remaining: i64, base: i64) -> i64 {
+    match remaining {
+        r if r > 0 && r < 500 => 300, // <10% of 5000 left: 5m
+        r if r > 0 && r < 2000 => 60, // <40% left: 1m
+        _ => base,                    // healthy (or unknown): base (20s)
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -80,7 +98,7 @@ fn fresh(at: i64, ttl: i64) -> bool {
 /// locked. Returns immediately — the worker runs in background.
 pub fn maybe_spawn_refresh() {
     let cur = RecentPrs::load();
-    let ttl = config::config().recent_prs_ttl();
+    let ttl = adaptive_ttl(cur.rate_remaining, config::config().recent_prs_ttl());
     if fresh(cur.fetched_at, ttl) && !cur.prs.is_empty() {
         return;
     }
@@ -120,14 +138,14 @@ pub fn run_refresh() {
 
     // Re-check freshness inside the lock.
     let mut cur = RecentPrs::load();
-    let ttl = config::config().recent_prs_ttl();
+    let ttl = adaptive_ttl(cur.rate_remaining, config::config().recent_prs_ttl());
     if fresh(cur.fetched_at, ttl) && !cur.prs.is_empty() {
         return;
     }
     cur.locked_at = now_epoch();
     let _ = cur.save();
 
-    if let Some(mut prs) = fetch() {
+    if let Some((mut prs, remaining)) = fetch() {
         // Second pass: hydrate any URLs referenced by other_prs.urls in any
         // session state file that aren't already present in the freshly
         // fetched viewer.pullRequests result. This catches PRs older than
@@ -142,20 +160,36 @@ pub fn run_refresh() {
             version: crate::state::STATE_VERSION.into(),
             fetched_at: now_epoch(),
             locked_at: 0,
+            // Carry the last-seen headroom forward (0 = unobserved → healthy),
+            // so `adaptive_ttl` can space out the next round of refreshes.
+            rate_remaining: remaining.unwrap_or(cur.rate_remaining),
             prs,
         };
         let _ = new.save();
     } else {
-        // Fetch failed — clear the lock so the next render can retry, but
-        // keep the previously-cached prs intact.
-        cur.locked_at = 0;
+        // Fetch failed (commonly a rate-limit). Stamp `locked_at = now` so the
+        // debounce holds for `ttl.max(60)`s instead of re-spawning a worker on
+        // the very next render — otherwise, exactly when we're rate-limited,
+        // every live session hammers the API in a tight loop and never
+        // recovers. Keep the previously-cached prs intact.
+        cur.locked_at = now_epoch();
         let _ = cur.save();
     }
 }
 
-/// Walks every session state TOML in `cache_dir()` (excluding `recent_prs.toml`
-/// itself) and returns the union of `other_prs.urls` entries that are missing
-/// from `have`.
+/// A session state file older than this (by mtime) is treated as a dead
+/// session: nobody is viewing its chips, so we neither hydrate its URLs nor let
+/// them grow the global fetch, and we delete it. Without this, dead sessions
+/// accumulate indefinitely (hundreds observed) and every global refresh
+/// re-fetches all their PRs by URL — tens of extra GraphQL queries per cycle,
+/// enough on its own to exhaust the 5000/hr budget.
+const STALE_SESSION_SECS: i64 = 24 * 60 * 60;
+
+/// Walks every *live* session state TOML in `cache_dir()` (excluding
+/// `recent_prs.toml` itself) and returns the union of `other_prs.urls` entries
+/// that are missing from `have`. Files whose mtime is older than
+/// `STALE_SESSION_SECS` are skipped and deleted — a dead session's chips have
+/// no viewer, so refreshing them just burns API budget.
 fn collect_missing_urls(have: &HashMap<String, PrEntry>) -> Vec<String> {
     let dir = config::cache_dir();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -169,6 +203,11 @@ fn collect_missing_urls(have: &HashMap<String, PrEntry>) -> Vec<String> {
             continue;
         }
         if path.file_name().and_then(|s| s.to_str()) == Some("recent_prs.toml") {
+            continue;
+        }
+        // Prune dead sessions: skip (and remove) files not touched recently.
+        if crate::cache::mtime(&path).is_some_and(|m| now_epoch() - m > STALE_SESSION_SECS) {
+            let _ = std::fs::remove_file(&path);
             continue;
         }
         let text = match std::fs::read_to_string(&path) {
@@ -214,16 +253,19 @@ pub(crate) fn parse_pr_url(url: &str) -> Option<(String, String, u64)> {
 }
 
 /// Batched PR-by-(owner,repo,number) lookup using aliased `repository.pullRequest`
-/// fields. Splits into chunks of 50 to keep below GraphQL complexity caps and
-/// to make per-batch failure recoverable. A failed alias inside an otherwise-
-/// successful batch is skipped silently.
+/// fields. Each chunk is one GraphQL query of single-object lookups (no
+/// `first`/`last` connection), so it costs ~1 rate-limit point regardless of
+/// how many aliases it packs — fewer, larger chunks means fewer points. 100
+/// stays well within GraphQL's node/complexity caps while halving the query
+/// count vs the old 50. A failed alias inside an otherwise-successful batch is
+/// skipped silently.
 fn fetch_by_urls(urls: &[String]) -> HashMap<String, PrEntry> {
     let mut out = HashMap::new();
     let parsed: Vec<(String, (String, String, u64))> = urls
         .iter()
         .filter_map(|u| parse_pr_url(u).map(|p| (u.clone(), p)))
         .collect();
-    for chunk in parsed.chunks(50) {
+    for chunk in parsed.chunks(100) {
         if let Some(map) = fetch_chunk(chunk) {
             out.extend(map);
         }
@@ -311,6 +353,18 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_ttl_tiers() {
+        // healthy or unobserved (0) → base; low → 1m; very low → 5m.
+        assert_eq!(adaptive_ttl(0, 20), 20);
+        assert_eq!(adaptive_ttl(5000, 20), 20);
+        assert_eq!(adaptive_ttl(2000, 20), 20);
+        assert_eq!(adaptive_ttl(1999, 20), 60);
+        assert_eq!(adaptive_ttl(500, 20), 60);
+        assert_eq!(adaptive_ttl(499, 20), 300);
+        assert_eq!(adaptive_ttl(1, 20), 300);
+    }
+
+    #[test]
     fn parse_pr_url_with_dashes_dots() {
         assert_eq!(
             parse_pr_url("https://github.com/some-org/my.repo/pull/7"),
@@ -329,6 +383,7 @@ mod tests {
 }
 
 const QUERY: &str = r#"query {
+  rateLimit { remaining }
   viewer {
     pullRequests(first: 100, orderBy: {field: UPDATED_AT, direction: DESC}, states: [OPEN, MERGED, CLOSED]) {
       nodes { url state isDraft number mergedAt autoMergeRequest { __typename } }
@@ -336,8 +391,11 @@ const QUERY: &str = r#"query {
   }
 }"#;
 
-fn fetch() -> Option<HashMap<String, PrEntry>> {
+/// Returns `(prs, rateLimit.remaining)`. `remaining` is `None` when the field
+/// is absent (older API / unexpected shape); `rateLimit` itself costs 0 points.
+fn fetch() -> Option<(HashMap<String, PrEntry>, Option<i64>)> {
     let v = crate::github::graphql(QUERY)?;
+    let remaining = v.pointer("/data/rateLimit/remaining").and_then(Value::as_i64);
     let nodes = v
         .get("data")?
         .get("viewer")?
@@ -373,5 +431,5 @@ fn fetch() -> Option<HashMap<String, PrEntry>> {
             },
         );
     }
-    Some(map)
+    Some((map, remaining))
 }
