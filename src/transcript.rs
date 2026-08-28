@@ -150,111 +150,90 @@ pub struct BurnInfo {
     pub tokens_total: u64,
 }
 
-pub fn burn_rate(session: &Session, st: &mut State) -> BurnInfo {
-    let mut out = BurnInfo::default();
-    if session.transcript.is_empty()
-        || !Path::new(&session.transcript).exists()
-        || session.duration_ms <= 60_000
-    {
-        return out;
+/// Token burn and the subagent counter in one pass over the transcript.
+///
+/// Both metrics used to walk the file independently, so a render whose mtime
+/// had moved read and JSON-parsed the whole thing twice — ~80ms of foreground
+/// CPU on a 37MB transcript, every turn.
+///
+/// ponytail: still O(file) per change. The transcript is append-only JSONL, so
+/// the upgrade is to cache a byte offset alongside the mtime and parse only the
+/// tail, full-rescanning when the file shrinks (`/compact` rewrites it).
+pub fn scan(session: &Session, st: &mut State) -> (BurnInfo, AgentCount) {
+    let mut burn = BurnInfo::default();
+    let mut agents = AgentCount::default();
+    if session.transcript.is_empty() || !Path::new(&session.transcript).exists() {
+        return (burn, agents);
     }
+
     let tm = mtime(Path::new(&session.transcript)).unwrap_or(0);
-    if st.burn.transcript_mtime != tm {
+    if st.burn.transcript_mtime != tm || st.agents.transcript_mtime != tm {
+        let s = scan_file(&session.transcript);
         st.burn.transcript_mtime = tm;
-        st.burn.total_tokens = sum_transcript_tokens(&session.transcript);
+        st.burn.total_tokens = s.tokens;
+        st.agents.transcript_mtime = tm;
+        st.agents.active = s.agents_active;
+        st.agents.total = s.agents_total;
     }
-    if st.burn.total_tokens == 0 {
-        return out;
+
+    agents.active = st.agents.active;
+    agents.total = st.agents.total;
+
+    // Burn needs a minute of wall time before a rate means anything.
+    if session.duration_ms > 60_000 && st.burn.total_tokens > 0 {
+        burn.tokens_total = st.burn.total_tokens;
+        burn.tokens_per_hour = st
+            .burn
+            .total_tokens
+            .saturating_mul(3_600_000)
+            .checked_div(session.duration_ms.max(1) as u64)
+            .unwrap_or(0);
     }
-    out.tokens_total = st.burn.total_tokens;
-    out.tokens_per_hour = st
-        .burn
-        .total_tokens
-        .saturating_mul(3_600_000)
-        .checked_div(session.duration_ms.max(1) as u64)
-        .unwrap_or(0);
-    out
+    (burn, agents)
 }
 
-fn sum_transcript_tokens(path: &str) -> u64 {
+#[derive(Debug, Default, PartialEq)]
+struct ScanStats {
+    tokens: u64,
+    agents_active: u32,
+    agents_total: u32,
+}
+
+/// One read, one JSON parse per line, both metrics accumulated together.
+fn scan_file(path: &str) -> ScanStats {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(_) => return 0,
+        Err(_) => return ScanStats::default(),
     };
-    let mut total: u64 = 0;
+    let mut out = ScanStats::default();
+    let mut open: HashSet<String> = HashSet::new();
     for line in text.lines() {
         let v: Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let usage = match v
-            .get("message")
-            .and_then(|m| m.get("usage"))
-            .and_then(|u| u.as_object())
-        {
-            Some(u) => u,
+        let msg = match v.get("message") {
+            Some(m) => m,
             None => continue,
         };
-        let pick = |k| usage.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
-        total += pick("input_tokens")
-            + pick("output_tokens")
-            + pick("cache_creation_input_tokens")
-            + pick("cache_read_input_tokens");
-    }
-    total
-}
-
-#[derive(Debug, Default)]
-pub struct AgentCount {
-    pub active: u32,
-    pub total: u32,
-}
-
-pub fn agent_counter(session: &Session, st: &mut State) -> AgentCount {
-    let mut out = AgentCount::default();
-    if session.transcript.is_empty() || !Path::new(&session.transcript).exists() {
-        return out;
-    }
-    let tm = mtime(Path::new(&session.transcript)).unwrap_or(0);
-    if st.agents.transcript_mtime != tm {
-        let (a, t) = compute_agents(&session.transcript);
-        st.agents.transcript_mtime = tm;
-        st.agents.active = a;
-        st.agents.total = t;
-    }
-    out.active = st.agents.active;
-    out.total = st.agents.total;
-    out
-}
-
-fn compute_agents(path: &str) -> (u32, u32) {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(_) => return (0, 0),
-    };
-    let mut open: HashSet<String> = HashSet::new();
-    let mut total: u32 = 0;
-    for line in text.lines() {
-        let v: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let arr = v
-            .get("message")
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_array());
-        let arr = match arr {
+        if let Some(usage) = msg.get("usage").and_then(|u| u.as_object()) {
+            let pick = |k| usage.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+            out.tokens += pick("input_tokens")
+                + pick("output_tokens")
+                + pick("cache_creation_input_tokens")
+                + pick("cache_read_input_tokens");
+        }
+        let arr = match msg.get("content").and_then(|c| c.as_array()) {
             Some(a) => a,
             None => continue,
         };
         for item in arr {
-            let typ = item.get("type").and_then(|x| x.as_str()).unwrap_or("");
-            match typ {
+            match item.get("type").and_then(|x| x.as_str()).unwrap_or("") {
                 "tool_use" => {
                     if item.get("name").and_then(|x| x.as_str()) == Some("Agent") {
                         if let Some(id) = item.get("id").and_then(|x| x.as_str()) {
                             open.insert(id.to_string());
-                            total += 1;
+                            out.agents_total += 1;
                         }
                     }
                 }
@@ -267,7 +246,14 @@ fn compute_agents(path: &str) -> (u32, u32) {
             }
         }
     }
-    (open.len() as u32, total)
+    out.agents_active = open.len() as u32;
+    out
+}
+
+#[derive(Debug, Default)]
+pub struct AgentCount {
+    pub active: u32,
+    pub total: u32,
 }
 
 #[cfg(test)]
@@ -294,5 +280,58 @@ mod tests {
     #[test]
     fn scan_pr_urls_empty_when_none() {
         assert!(scan_pr_urls("no links here").is_empty());
+    }
+
+    /// The merged pass must still total usage across every shape of line and
+    /// leave the agent counter agreeing with the tool_use/tool_result pairing:
+    /// two Agents dispatched, one returned, so one stays open.
+    #[test]
+    fn scan_file_totals_tokens_and_pairs_agents() {
+        let lines = [
+            r#"{"message":{"usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":1,"cache_read_input_tokens":2}}}"#,
+            r#"{"message":{"content":[{"type":"tool_use","name":"Agent","id":"a1"},{"type":"tool_use","name":"Bash","id":"b1"}]}}"#,
+            r#"{"message":{"content":[{"type":"tool_use","name":"Agent","id":"a2"}],"usage":{"input_tokens":7}}}"#,
+            r#"{"message":{"content":[{"type":"tool_result","tool_use_id":"a1"}]}}"#,
+            "not json at all",
+            r#"{"no_message":true}"#,
+        ];
+        let dir = std::env::temp_dir().join(format!("cc-scan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.jsonl");
+        std::fs::write(&p, lines.join("\n")).unwrap();
+
+        let got = scan_file(p.to_str().unwrap());
+        assert_eq!(
+            got,
+            ScanStats {
+                tokens: 25,       // 10+5+1+2 then +7
+                agents_active: 1, // a2 still open, a1 returned
+                agents_total: 2,  // Bash is not an Agent
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A line carrying both usage and content must be counted by both halves —
+    /// the failure mode of merging two loops into one is an early `continue`
+    /// that skips the other metric.
+    #[test]
+    fn scan_file_counts_both_metrics_on_one_line() {
+        let dir = std::env::temp_dir().join(format!("cc-scan2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.jsonl");
+        std::fs::write(
+            &p,
+            r#"{"message":{"usage":{"input_tokens":3},"content":[{"type":"tool_use","name":"Agent","id":"x"}]}}"#,
+        )
+        .unwrap();
+
+        let got = scan_file(p.to_str().unwrap());
+        assert_eq!(got.tokens, 3, "usage on an Agent line must still count");
+        assert_eq!(
+            got.agents_total, 1,
+            "Agent on a usage line must still count"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

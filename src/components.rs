@@ -1106,8 +1106,7 @@ impl Component for CtxBar {
 pub struct Loc;
 
 fn location_icon() -> String {
-    let env = std::env::vars().collect::<std::collections::HashMap<_, _>>();
-    let has = |k: &str| env.get(k).filter(|v| !v.is_empty()).is_some();
+    let has = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
     if has("SSH_CONNECTION") || has("SSH_CLIENT") || has("SSH_TTY") {
         return format!("{FG_YELLOW}{SSH_TERM}{RESET}");
     }

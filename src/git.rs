@@ -169,7 +169,10 @@ fn dirty_count(repo: &git2::Repository) -> u32 {
 }
 
 pub fn extract_ticket(branch: &str) -> Option<String> {
-    let re = regex::Regex::new(r"([A-Za-z][A-Za-z]+)-([0-9]+)").ok()?;
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"([A-Za-z][A-Za-z]+)-([0-9]+)").expect("static ticket regex is valid")
+    });
     re.captures(branch).map(|c| {
         let prefix = c.get(1).unwrap().as_str().to_uppercase();
         let num = c.get(2).unwrap().as_str();
