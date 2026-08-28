@@ -145,6 +145,11 @@ pub fn run_refresh() {
     cur.locked_at = now_epoch();
     let _ = cur.save();
 
+    // Local disk hygiene, before the fetch and regardless of whether it
+    // succeeds: a rate-limited run is exactly when the cache dir is most
+    // bloated, so this must not hang off the success path.
+    sweep_orphan_sidecars(&config::cache_dir());
+
     if let Some((mut prs, remaining)) = fetch() {
         // Second pass: hydrate any URLs referenced by other_prs.urls in any
         // session state file that aren't already present in the freshly
@@ -256,6 +261,38 @@ fn collect_missing_urls(have: &HashMap<String, PrEntry>) -> Vec<String> {
     seen.into_iter().collect()
 }
 
+/// Delete `<id>.toml.lock` / `<id>.toml.tmp` sidecars whose `<id>.toml` is
+/// gone. The session GC above only ever removed the state file, so its lock
+/// outlived it forever (1324 orphans against 18 live states observed).
+///
+/// Orphan-only, and dead-old on top: a live session rewrites its state file
+/// every render, so a missing `.toml` means nothing can still be holding the
+/// matching lock. Deleting one that *was* held would let a second worker lock
+/// a fresh inode and race the holder.
+fn sweep_orphan_sidecars(dir: &std::path::Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match path.extension().and_then(|s| s.to_str()) {
+            Some("lock") | Some("tmp") => {}
+            _ => continue,
+        }
+        // `<id>.toml.lock` → `<id>.toml`; skip anything not shaped that way.
+        let owner = path.with_extension("");
+        if owner.extension().and_then(|s| s.to_str()) != Some("toml") || owner.exists() {
+            continue;
+        }
+        if let Some(m) = crate::cache::mtime(&path) {
+            if matches!(classify_age(now_epoch() - m), SessionAge::Dead) {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
 /// Parse `https://github.com/OWNER/REPO/pull/N` (with optional trailing
 /// path/query/fragment) into `(owner, repo, number)`. Returns `None` for any
 /// input that doesn't look like a PR URL.
@@ -355,6 +392,54 @@ fn fetch_chunk(chunk: &[(String, (String, String, u64))]) -> Option<HashMap<Stri
         );
     }
     Some(map)
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// Backdate a file's mtime by `secs` so `classify_age` sees it as dead.
+    fn backdate(p: &Path, secs: i64) {
+        let t = (now_epoch() - secs) as libc::time_t;
+        let tv = libc::timeval {
+            tv_sec: t,
+            tv_usec: 0,
+        };
+        let times = [tv, tv];
+        let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::utimes(c.as_ptr(), times.as_ptr()) }, 0);
+    }
+
+    #[test]
+    fn sweeps_only_dead_orphan_sidecars() {
+        let dir = std::env::temp_dir().join(format!("cc-sweep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = STALE_SESSION_SECS + 60;
+
+        let orphan = dir.join("a.toml.lock");
+        let orphan_tmp = dir.join("b.toml.tmp");
+        let owned = dir.join("c.toml.lock");
+        let owner = dir.join("c.toml");
+        let fresh_orphan = dir.join("d.toml.lock");
+        for p in [&orphan, &orphan_tmp, &owned, &owner, &fresh_orphan] {
+            std::fs::write(p, "").unwrap();
+        }
+        // c's owner still exists → its lock may be held; d is orphaned but new.
+        for p in [&orphan, &orphan_tmp, &owned, &owner] {
+            backdate(p, old);
+        }
+
+        sweep_orphan_sidecars(&dir);
+
+        assert!(!orphan.exists(), "dead orphan lock must be swept");
+        assert!(!orphan_tmp.exists(), "dead orphan tmp must be swept");
+        assert!(owned.exists(), "lock with a live owner must survive");
+        assert!(owner.exists(), "state file is not this sweep's business");
+        assert!(fresh_orphan.exists(), "recent orphan must survive");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
