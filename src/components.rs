@@ -4,7 +4,7 @@
 // 3-5 size variants. Registry-style `render_named` dispatch lives at the
 // bottom — keeps the layout engine ignorant of component types.
 
-use crate::component::{Component, RenderCtx, Rendered, Size};
+use crate::component::{Component, ComponentConfig, RenderCtx, Rendered, Size};
 use crate::git::CiState;
 use crate::glyphs::*;
 use crate::pct::{self, PctConfig, PctMode};
@@ -1251,135 +1251,152 @@ pub fn quotas_bucket_kind(name: &str) -> Option<BucketKind> {
         .and_then(BucketKind::from_suffix)
 }
 
-// ─── registry-style dispatch ────────────────────────────────────────────
+// ─── registry ───────────────────────────────────────────────────────────
+
+/// One row per component: everything the layout engine needs to know about it.
+///
+/// This is the single place a component is registered. It used to take five
+/// parallel `match name` arms — render, sizes, default size, priority, and the
+/// config-block lookup over in `config.rs` — so adding a component meant
+/// editing five tables and silently misbehaving if you missed one.
+///
+/// The function-pointer fields exist because trait methods can't be called in
+/// a `static` initializer; a non-capturing closure coerces to `fn` and can.
+pub struct Entry {
+    pub name: &'static str,
+    sizes: fn() -> &'static [Size],
+    default_size: fn() -> Size,
+    /// Higher = shrunk LAST. Keep important visual cues (spinner, ctx_bar,
+    /// model, branch) high and nice-to-haves (chips, burn, agents) low.
+    priority: u32,
+    render: fn(Size, &RenderCtx) -> Rendered,
+    /// The `[name]` block's common config, pulled out of the parsed `Config`.
+    common: fn(&crate::config::Config) -> ComponentConfig,
+}
+
+/// Shorthand for a component whose `[name]` block is a plain `ComponentConfig`
+/// held in an `Option` field on `Config`, and which takes no extension config.
+macro_rules! plain {
+    ($name:literal, $ty:ident, $priority:expr, $field:ident) => {
+        Entry {
+            name: $name,
+            sizes: <$ty as Component>::sizes,
+            default_size: <$ty as Component>::default_size,
+            priority: $priority,
+            render: |s, ctx| $ty.render(s, &(), ctx),
+            common: |c| c.$field.clone().unwrap_or_default(),
+        }
+    };
+}
+
+static REGISTRY: &[Entry] = &[
+    plain!("repo", Repo, 20, repo),
+    plain!("branch", Branch, 75, branch),
+    plain!("pr_icon", PrIcon, 70, pr_icon),
+    plain!("pr_num", PrNum, 65, pr_num),
+    plain!("ci", Ci, 50, ci),
+    plain!("review", Review, 45, review),
+    plain!("comments", Comments, 25, comments),
+    plain!("dirty", Dirty, 35, dirty),
+    plain!("ahead", Ahead, 30, ahead),
+    plain!("behind", Behind, 30, behind),
+    plain!("ticket", Ticket, 40, ticket),
+    Entry {
+        name: "chips",
+        sizes: <Chips as Component>::sizes,
+        default_size: <Chips as Component>::default_size,
+        priority: 5,
+        render: |s, ctx| Chips.render(s, &crate::config::config().chips, ctx),
+        common: |c| c.chips.common.clone(),
+    },
+    Entry {
+        name: "burn",
+        sizes: <Burn as Component>::sizes,
+        default_size: <Burn as Component>::default_size,
+        priority: 8,
+        render: |s, ctx| Burn.render(s, &crate::config::config().burn, ctx),
+        common: |c| c.burn.common.clone(),
+    },
+    plain!("agents", Agents, 10, agents),
+    Entry {
+        name: "quotas",
+        sizes: <Quotas as Component>::sizes,
+        default_size: <Quotas as Component>::default_size,
+        priority: 15,
+        render: |s, ctx| Quotas.render(s, &crate::config::config().quotas, ctx),
+        common: |c| c.quotas.common.clone(),
+    },
+    Entry {
+        name: "ctx_bar",
+        sizes: <CtxBar as Component>::sizes,
+        default_size: <CtxBar as Component>::default_size,
+        priority: 90,
+        render: |s, ctx| CtxBar.render(s, &crate::config::config().ctx_bar, ctx),
+        common: |c| c.ctx_bar.common.clone(),
+    },
+    plain!("loc", Loc, 60, loc),
+    plain!("model", Model, 80, model),
+    plain!("effort", Effort, 55, effort),
+    plain!("spinner", Spinner, 100, spinner_cfg),
+];
+
+/// The registry row for `name`. `quotas.<bucket>` pseudo-components share the
+/// `quotas` row for sizes and rendering shape; only their priority and config
+/// block differ, which `default_priority` and `Config::component_config`
+/// handle on their own.
+fn entry(name: &str) -> Option<&'static Entry> {
+    REGISTRY
+        .iter()
+        .find(|e| e.name == name)
+        .or_else(|| quotas_bucket_kind(name).and(REGISTRY.iter().find(|e| e.name == "quotas")))
+}
+
+/// Every registered component name, in registry order.
+pub fn all_names() -> impl Iterator<Item = &'static str> {
+    REGISTRY.iter().map(|e| e.name)
+}
 
 /// Render a component by name at the given size. Returns `None` if the name
 /// is not a registered component.
 pub fn render_named(name: &str, size: Size, ctx: &RenderCtx) -> Option<Rendered> {
-    let cfg = crate::config::config();
-    Some(match name {
-        "repo" => Repo.render(size, &(), ctx),
-        "branch" => Branch.render(size, &(), ctx),
-        "pr_icon" => PrIcon.render(size, &(), ctx),
-        "pr_num" => PrNum.render(size, &(), ctx),
-        "ci" => Ci.render(size, &(), ctx),
-        "review" => Review.render(size, &(), ctx),
-        "comments" => Comments.render(size, &(), ctx),
-        "dirty" => Dirty.render(size, &(), ctx),
-        "ahead" => Ahead.render(size, &(), ctx),
-        "behind" => Behind.render(size, &(), ctx),
-        "ticket" => Ticket.render(size, &(), ctx),
-        "chips" => Chips.render(size, &cfg.chips, ctx),
-        "burn" => Burn.render(size, &cfg.burn, ctx),
-        "agents" => Agents.render(size, &(), ctx),
-        "quotas" => Quotas.render(size, &cfg.quotas, ctx),
-        n if quotas_bucket_kind(n).is_some() => {
-            let kind = quotas_bucket_kind(n).unwrap();
-            match render_one_bucket(&cfg.quotas, kind, ctx) {
-                Some(text) => Rendered::from_text(text),
-                None => Rendered::empty(),
-            }
-        }
-        "ctx_bar" => CtxBar.render(size, &cfg.ctx_bar, ctx),
-        "loc" => Loc.render(size, &(), ctx),
-        "model" => Model.render(size, &(), ctx),
-        "effort" => Effort.render(size, &(), ctx),
-        "spinner" => Spinner.render(size, &(), ctx),
-        _ => return None,
-    })
+    // A `quotas.<bucket>` row renders one bucket rather than the whole block.
+    if let Some(kind) = quotas_bucket_kind(name) {
+        let cfg = crate::config::config();
+        return Some(match render_one_bucket(&cfg.quotas, kind, ctx) {
+            Some(text) => Rendered::from_text(text),
+            None => Rendered::empty(),
+        });
+    }
+    let e = entry(name)?;
+    Some((e.render)(size, ctx))
 }
-
-/// All known component names — used for default layouts and config validation.
-pub const ALL_NAMES: &[&str] = &[
-    "repo", "branch", "pr_icon", "pr_num", "ci", "review", "comments", "dirty", "ahead", "behind",
-    "ticket", "chips", "burn", "agents", "quotas", "ctx_bar", "loc", "model", "effort", "spinner",
-];
 
 /// Sizes a named component supports. Returns `None` if unknown.
 pub fn sizes_for(name: &str) -> Option<&'static [Size]> {
-    Some(match name {
-        "repo" => Repo::sizes(),
-        "branch" => Branch::sizes(),
-        "pr_icon" => PrIcon::sizes(),
-        "pr_num" => PrNum::sizes(),
-        "ci" => Ci::sizes(),
-        "review" => Review::sizes(),
-        "comments" => Comments::sizes(),
-        "dirty" => Dirty::sizes(),
-        "ahead" => Ahead::sizes(),
-        "behind" => Behind::sizes(),
-        "ticket" => Ticket::sizes(),
-        "chips" => Chips::sizes(),
-        "burn" => Burn::sizes(),
-        "agents" => Agents::sizes(),
-        "quotas" => Quotas::sizes(),
-        n if quotas_bucket_kind(n).is_some() => Quotas::sizes(),
-        "ctx_bar" => CtxBar::sizes(),
-        "loc" => Loc::sizes(),
-        "model" => Model::sizes(),
-        "effort" => Effort::sizes(),
-        "spinner" => Spinner::sizes(),
-        _ => return None,
-    })
+    Some((entry(name)?.sizes)())
 }
 
 pub fn default_size_for(name: &str) -> Option<Size> {
-    Some(match name {
-        "repo" => Repo::default_size(),
-        "branch" => Branch::default_size(),
-        "pr_icon" => PrIcon::default_size(),
-        "pr_num" => PrNum::default_size(),
-        "ci" => Ci::default_size(),
-        "review" => Review::default_size(),
-        "comments" => Comments::default_size(),
-        "dirty" => Dirty::default_size(),
-        "ahead" => Ahead::default_size(),
-        "behind" => Behind::default_size(),
-        "ticket" => Ticket::default_size(),
-        "chips" => Chips::default_size(),
-        "burn" => Burn::default_size(),
-        "agents" => Agents::default_size(),
-        "quotas" => Quotas::default_size(),
-        n if quotas_bucket_kind(n).is_some() => Quotas::default_size(),
-        "ctx_bar" => CtxBar::default_size(),
-        "loc" => Loc::default_size(),
-        "model" => Model::default_size(),
-        "effort" => Effort::default_size(),
-        "spinner" => Spinner::default_size(),
-        _ => return None,
-    })
+    Some((entry(name)?.default_size)())
 }
 
-/// Default priority assignments. Higher = shrunk later. Keep important visual
-/// cues (model, ctx_bar, spinner, branch) high; nice-to-haves (chips, burn,
-/// agents) low. Required-to-show items can also set `required = true`.
+/// Default priority. The `quotas.<bucket>` pseudo-components sit above the
+/// combined `quotas` row so an individual bucket survives longer than the
+/// block it came from.
 pub fn default_priority(name: &str) -> u32 {
     match name {
-        "spinner" => 100,
-        "ctx_bar" => 90,
-        "model" => 80,
-        "branch" => 75,
-        "pr_icon" => 70,
-        "pr_num" => 65,
-        "loc" => 60,
-        "effort" => 55,
-        "ci" => 50,
-        "review" => 45,
-        "ticket" => 40,
-        "dirty" => 35,
-        "ahead" | "behind" => 30,
-        "comments" => 25,
-        "repo" => 20,
-        "quotas" => 15,
         "quotas.hourly" => 25,
         "quotas.weekly" => 20,
         "quotas.design" => 18,
         "quotas.sonnet" => 17,
-        "agents" => 10,
-        "burn" => 8,
-        "chips" => 5,
-        _ => 5,
+        _ => entry(name).map(|e| e.priority).unwrap_or(5),
     }
+}
+
+/// The `[name]` common config block, or a default when the component is
+/// unknown or the user wrote no block for it.
+pub fn common_config(cfg: &crate::config::Config, name: &str) -> ComponentConfig {
+    entry(name).map(|e| (e.common)(cfg)).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -2484,5 +2501,70 @@ mod tests {
         let txt = render_chips(&other, &cfg, "https://github.com/foo/bar/pull/999");
         assert!(txt.contains("#101"), "stack bypass: {txt}");
         assert!(txt.contains("#102"), "stack bypass: {txt}");
+    }
+
+    /// The registry is the single source of truth: every row must answer all
+    /// five questions the layout engine asks. A half-registered component used
+    /// to be possible — five parallel match tables, miss one, get a silent
+    /// default.
+    #[test]
+    fn registry_rows_are_complete_and_consistent() {
+        let names: Vec<&str> = all_names().collect();
+        assert!(!names.is_empty(), "registry must not be empty");
+
+        // Names unique.
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(before, sorted.len(), "duplicate component name in registry");
+
+        for name in &names {
+            let sizes = sizes_for(name).unwrap_or_else(|| panic!("{name} has no sizes"));
+            assert!(!sizes.is_empty(), "{name} declares an empty size list");
+
+            let d = default_size_for(name).unwrap_or_else(|| panic!("{name} has no default size"));
+            assert!(
+                sizes.contains(&d),
+                "{name} default size {d:?} is not in its own size list {sizes:?}"
+            );
+
+            // Every row resolves a priority and a config block without panicking.
+            let _ = default_priority(name);
+            let _ = common_config(&crate::config::Config::default(), name);
+        }
+
+        // The layout defaults may only name registered components.
+        for n in crate::config::default_left()
+            .into_iter()
+            .chain(crate::config::default_right())
+        {
+            assert!(
+                sizes_for(&n).is_some(),
+                "default layout names unregistered component {n:?}"
+            );
+        }
+    }
+
+    /// `quotas.<bucket>` pseudo-components borrow the quotas row for shape but
+    /// keep their own priority, which must outrank the combined block.
+    #[test]
+    fn quotas_buckets_resolve_through_the_registry() {
+        for b in [
+            "quotas.hourly",
+            "quotas.weekly",
+            "quotas.design",
+            "quotas.sonnet",
+        ] {
+            assert_eq!(
+                sizes_for(b),
+                sizes_for("quotas"),
+                "{b} must share the quotas size list"
+            );
+            assert!(
+                default_priority(b) > default_priority("quotas"),
+                "{b} should outlive the combined quotas block"
+            );
+        }
     }
 }
