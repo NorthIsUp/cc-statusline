@@ -67,6 +67,12 @@ pub struct PrEntry {
     /// queued to auto-merge when checks pass.
     #[serde(default)]
     pub auto_merge: bool,
+    /// When this entry was last read from GitHub. Drives the top-up: the
+    /// oldest entries ride along in whatever request we were making anyway.
+    /// `0` (an entry cached before this field existed) sorts oldest, so it
+    /// is refreshed first.
+    #[serde(default)]
+    pub checked_at: i64,
 }
 
 impl RecentPrs {
@@ -102,6 +108,56 @@ fn fresh(at: i64, ttl: i64) -> bool {
 
 /// A PR merged at least this long ago is settled: never re-fetch it.
 const MERGED_SETTLED_AFTER: i64 = 7 * 86_400;
+
+/// How many aliased PR lookups to put in one request.
+///
+/// GitHub charges GraphQL by node count, and measured against this exact query
+/// shape the cost is flat: 1, 5, 10, 20, 30, 35 and 40 aliases all cost **1
+/// point**; 50 costs 2 and 100 costs 3. So a request carrying one lookup and a
+/// request carrying forty cost the same, and any request that goes out less
+/// than full has wasted capacity already paid for.
+///
+/// Recorded rather than tuned by feel: GitHub can change the cost formula, and
+/// a repo with more check contexts could push a batch over. If the observed
+/// cost of a refresh climbs, this constant and that measurement are the place
+/// to look.
+const BATCH_MAX: usize = 40;
+
+/// The URLs to fetch this cycle: everything that *must* be refreshed, then the
+/// stalest entries we already hold, until the request is full.
+///
+/// The top-up is free — see `BATCH_MAX` — and every entry it refreshes is one
+/// that will not need a request of its own later. Settled merges are skipped:
+/// they are frozen, so spending a slot on one buys nothing.
+fn fetch_list(
+    missing: &[String],
+    have: &HashMap<String, PrEntry>,
+    now: i64,
+    cap: usize,
+) -> Vec<String> {
+    let mut out: Vec<String> = missing.iter().take(cap).cloned().collect();
+    if out.len() >= cap {
+        return out;
+    }
+
+    let already: std::collections::HashSet<&str> = out.iter().map(String::as_str).collect();
+    let mut candidates: Vec<(i64, &String)> = have
+        .iter()
+        .filter(|(url, e)| {
+            let settled =
+                e.state == "MERGED" && e.merged_at.is_some_and(|t| now - t >= MERGED_SETTLED_AFTER);
+            !already.contains(url.as_str()) && !settled
+        })
+        .map(|(url, e)| (e.checked_at, url))
+        .collect();
+    // Stalest first; url breaks ties so the order is deterministic.
+    candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+
+    for (_, url) in candidates.into_iter().take(cap - out.len()) {
+        out.push(url.clone());
+    }
+    out
+}
 
 /// Seed `fresh` with every entry in `prev` that has settled — merged, and
 /// merged long enough ago that nothing about it can still change.
@@ -248,10 +304,15 @@ pub fn run_refresh() {
         // session state file that aren't already present in the freshly
         // fetched viewer.pullRequests result. This catches PRs older than
         // the 100 most-recently-updated `viewer.pullRequests` window.
+        // Fill the request: whatever is missing, plus the stalest entries we
+        // already hold. The top-up rides along for free — but only inside a
+        // request we were making anyway. With nothing missing we send nothing,
+        // rather than manufacturing a request to carry a free payload.
         let missing = collect_missing_urls(&prs);
         if !missing.is_empty() {
-            for (url, entry) in fetch_by_urls(&missing) {
-                prs.entry(url).or_insert(entry);
+            let to_fetch = fetch_list(&missing, &prs, now_epoch(), BATCH_MAX);
+            for (url, entry) in fetch_by_urls(&to_fetch) {
+                prs.insert(url, entry);
             }
         }
         // The watchlist: one batched lookup covering every live session's
@@ -490,6 +551,7 @@ fn fetch_chunk(chunk: &[(String, (String, String, u64))]) -> Option<HashMap<Stri
                 number,
                 merged_at,
                 auto_merge,
+                checked_at: now_epoch(),
             },
         );
     }
@@ -550,6 +612,7 @@ fn fetch() -> Option<(HashMap<String, PrEntry>, Option<i64>)> {
                 number,
                 merged_at,
                 auto_merge,
+                checked_at: now_epoch(),
             },
         );
     }
@@ -689,6 +752,7 @@ mod carry_tests {
             number,
             merged_at: merged_ago.map(|d| NOW - d),
             auto_merge: false,
+            checked_at: NOW,
         }
     }
 
@@ -757,5 +821,114 @@ mod carry_tests {
             fresh["u4"].state, "OPEN",
             "live value must not be clobbered"
         );
+    }
+}
+
+#[cfg(test)]
+mod fill_tests {
+    use super::*;
+
+    const NOW: i64 = 1_800_000_000;
+
+    fn e(state: &str, merged_ago: Option<i64>, checked_ago: i64) -> PrEntry {
+        PrEntry {
+            state: state.into(),
+            is_draft: false,
+            number: 1,
+            merged_at: merged_ago.map(|d| NOW - d),
+            auto_merge: false,
+            checked_at: NOW - checked_ago,
+        }
+    }
+
+    /// Missing URLs are never displaced by the top-up — they are the reason
+    /// the request exists.
+    #[test]
+    fn missing_urls_come_first() {
+        let mut have = HashMap::new();
+        have.insert("old".to_string(), e("OPEN", None, 9_999));
+        let got = fetch_list(&["must".to_string()], &have, NOW, 40);
+        assert_eq!(got[0], "must");
+        assert!(got.contains(&"old".to_string()), "spare capacity used");
+    }
+
+    /// The top-up takes the stalest first — that is what makes it worth doing.
+    #[test]
+    fn top_up_is_ordered_stalest_first() {
+        let mut have = HashMap::new();
+        have.insert("fresh".to_string(), e("OPEN", None, 10));
+        have.insert("stale".to_string(), e("OPEN", None, 5_000));
+        have.insert("middling".to_string(), e("OPEN", None, 500));
+
+        let got = fetch_list(&[], &have, NOW, 2);
+        assert_eq!(got, vec!["stale".to_string(), "middling".to_string()]);
+    }
+
+    /// An entry cached before `checked_at` existed reads as 0, so it sorts
+    /// oldest and is refreshed first rather than never.
+    #[test]
+    fn unstamped_entries_refresh_first() {
+        let mut have = HashMap::new();
+        have.insert("legacy".to_string(), {
+            let mut x = e("OPEN", None, 0);
+            x.checked_at = 0;
+            x
+        });
+        have.insert("recent".to_string(), e("OPEN", None, 100));
+
+        let got = fetch_list(&[], &have, NOW, 1);
+        assert_eq!(got, vec!["legacy".to_string()]);
+    }
+
+    /// Settled merges are frozen — spending a free slot on one buys nothing.
+    #[test]
+    fn settled_merges_are_never_topped_up() {
+        let mut have = HashMap::new();
+        have.insert("settled".to_string(), e("MERGED", Some(8 * 86_400), 9_999));
+        have.insert("recent_merge".to_string(), e("MERGED", Some(86_400), 10));
+
+        let got = fetch_list(&[], &have, NOW, 40);
+        assert!(
+            !got.contains(&"settled".to_string()),
+            "settled must stay frozen"
+        );
+        assert!(
+            got.contains(&"recent_merge".to_string()),
+            "recent merge may refresh"
+        );
+    }
+
+    /// Never exceed the cap — going over is what costs a second point.
+    #[test]
+    fn never_exceeds_the_cap() {
+        let mut have = HashMap::new();
+        for i in 0..100 {
+            have.insert(format!("u{i}"), e("OPEN", None, i as i64));
+        }
+        let missing: Vec<String> = (0..10).map(|i| format!("m{i}")).collect();
+
+        let got = fetch_list(&missing, &have, NOW, BATCH_MAX);
+        assert_eq!(got.len(), BATCH_MAX);
+    }
+
+    /// More missing than the cap: they are truncated, not dropped silently
+    /// alongside a top-up that would push the request over.
+    #[test]
+    fn missing_alone_can_fill_the_request() {
+        let have = HashMap::new();
+        let missing: Vec<String> = (0..60).map(|i| format!("m{i}")).collect();
+        let got = fetch_list(&missing, &have, NOW, BATCH_MAX);
+        assert_eq!(got.len(), BATCH_MAX);
+        assert!(got.iter().all(|u| u.starts_with('m')));
+    }
+
+    /// No duplicates: a URL that is both missing and already held must not
+    /// occupy two slots in the same request.
+    #[test]
+    fn no_duplicate_slots() {
+        let mut have = HashMap::new();
+        have.insert("dupe".to_string(), e("OPEN", None, 9_999));
+        let got = fetch_list(&["dupe".to_string()], &have, NOW, 40);
+        assert_eq!(got.iter().filter(|u| *u == "dupe").count(), 1);
     }
 }
