@@ -35,7 +35,11 @@ fn agent() -> &'static ureq::Agent {
         use ureq::config::Config;
         use ureq::tls::{TlsConfig, TlsProvider};
         Config::builder()
-            .tls_config(TlsConfig::builder().provider(TlsProvider::NativeTls).build())
+            .tls_config(
+                TlsConfig::builder()
+                    .provider(TlsProvider::NativeTls)
+                    .build(),
+            )
             .timeout_global(Some(HTTP_TIMEOUT))
             .build()
             .new_agent()
@@ -130,9 +134,16 @@ fn parse_pr_view(v: &Value) -> Option<String> {
     pr.insert("state".into(), str_or_empty(node, "state"));
     pr.insert(
         "isDraft".into(),
-        Value::Bool(node.get("isDraft").and_then(Value::as_bool).unwrap_or(false)),
+        Value::Bool(
+            node.get("isDraft")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
     );
-    pr.insert("reviewDecision".into(), str_or_empty(node, "reviewDecision"));
+    pr.insert(
+        "reviewDecision".into(),
+        str_or_empty(node, "reviewDecision"),
+    );
     pr.insert("url".into(), str_or_empty(node, "url"));
     if let Some(num) = node.get("number").cloned() {
         pr.insert("number".into(), num);
@@ -243,7 +254,10 @@ mod tests {
         let pr: crate::git::PrJson = serde_json::from_str(&json).unwrap();
         assert_eq!(pr.state, "OPEN");
         assert_eq!(pr.number, Some(1672));
-        assert!(pr.auto_merge(), "autoMergeRequest present → auto_merge() true");
+        assert!(
+            pr.auto_merge(),
+            "autoMergeRequest present → auto_merge() true"
+        );
     }
 
     /// An open PR without automerge projects a null `autoMergeRequest`, so

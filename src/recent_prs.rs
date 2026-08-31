@@ -396,10 +396,19 @@ mod tests {
     #[test]
     fn classify_age_windows() {
         assert!(matches!(classify_age(0), SessionAge::Active));
-        assert!(matches!(classify_age(ACTIVE_SESSION_SECS), SessionAge::Active));
-        assert!(matches!(classify_age(ACTIVE_SESSION_SECS + 1), SessionAge::Idle));
+        assert!(matches!(
+            classify_age(ACTIVE_SESSION_SECS),
+            SessionAge::Active
+        ));
+        assert!(matches!(
+            classify_age(ACTIVE_SESSION_SECS + 1),
+            SessionAge::Idle
+        ));
         assert!(matches!(classify_age(STALE_SESSION_SECS), SessionAge::Idle));
-        assert!(matches!(classify_age(STALE_SESSION_SECS + 1), SessionAge::Dead));
+        assert!(matches!(
+            classify_age(STALE_SESSION_SECS + 1),
+            SessionAge::Dead
+        ));
     }
 
     #[test]
@@ -433,7 +442,9 @@ const QUERY: &str = r#"query {
 /// is absent (older API / unexpected shape); `rateLimit` itself costs 0 points.
 fn fetch() -> Option<(HashMap<String, PrEntry>, Option<i64>)> {
     let v = crate::github::graphql(QUERY)?;
-    let remaining = v.pointer("/data/rateLimit/remaining").and_then(Value::as_i64);
+    let remaining = v
+        .pointer("/data/rateLimit/remaining")
+        .and_then(Value::as_i64);
     let nodes = v
         .get("data")?
         .get("viewer")?

@@ -161,7 +161,11 @@ impl Component for PrIcon {
             return Rendered::empty();
         }
         let g = pr_state_glyph(&ctx.git.pr.state, ctx.git.pr.is_draft);
-        let c = pr_state_color(&ctx.git.pr.state, ctx.git.pr.is_draft, ctx.git.pr.auto_merge());
+        let c = pr_state_color(
+            &ctx.git.pr.state,
+            ctx.git.pr.is_draft,
+            ctx.git.pr.auto_merge(),
+        );
         Rendered::from_text(format!("{c}{g}{RESET}"))
     }
 }
@@ -229,7 +233,11 @@ impl Component for PrNum {
             Some(n) => n,
             None => return Rendered::empty(),
         };
-        let c = pr_state_color(&ctx.git.pr.state, ctx.git.pr.is_draft, ctx.git.pr.auto_merge());
+        let c = pr_state_color(
+            &ctx.git.pr.state,
+            ctx.git.pr.is_draft,
+            ctx.git.pr.auto_merge(),
+        );
         Rendered::from_text(format!("{c}#{n}{RESET}"))
     }
 }
@@ -527,14 +535,15 @@ fn filter_collapsed_merged(
         if merged_indices.len() > max {
             let mut sorted = merged_indices.clone();
             // Newest first; entries with no merged_at sort newest (kept).
-            sorted.sort_by_key(|&i| std::cmp::Reverse(
-                states
-                    .get(kept[i].as_str())
-                    .and_then(|s| s.merged_at)
-                    .unwrap_or(i64::MAX),
-            ));
-            let to_drop: std::collections::HashSet<usize> =
-                sorted.into_iter().skip(max).collect();
+            sorted.sort_by_key(|&i| {
+                std::cmp::Reverse(
+                    states
+                        .get(kept[i].as_str())
+                        .and_then(|s| s.merged_at)
+                        .unwrap_or(i64::MAX),
+                )
+            });
+            let to_drop: std::collections::HashSet<usize> = sorted.into_iter().skip(max).collect();
             let new_kept: Vec<String> = kept
                 .iter()
                 .enumerate()
@@ -722,9 +731,7 @@ impl Component for Chips {
                     };
                     if closed_count > 0 {
                         parts.push(' ');
-                        parts.push_str(&format!(
-                            "{FG_GH_CLOSED}{PR_CLOSED}×{closed_count}{RESET}"
-                        ));
+                        parts.push_str(&format!("{FG_GH_CLOSED}{PR_CLOSED}×{closed_count}{RESET}"));
                     }
                     for u in &filtered_urls {
                         if cfg.closed_summary
@@ -1058,15 +1065,11 @@ impl Component for CtxBar {
                     mode: PctMode::Dots,
                     ..cfg.pct.clone()
                 };
-                Rendered::from_text(format!(
-                    "{DIM}{CTX}{RESET} {}",
-                    pct::render(pct, &dots_cfg)
-                ))
+                Rendered::from_text(format!("{DIM}{CTX}{RESET} {}", pct::render(pct, &dots_cfg)))
             }
-            Size::S => Rendered::from_text(format!(
-                "{DIM}{CTX}{RESET} {}",
-                pct::render(pct, &cfg.pct)
-            )),
+            Size::S => {
+                Rendered::from_text(format!("{DIM}{CTX}{RESET} {}", pct::render(pct, &cfg.pct)))
+            }
             Size::M => {
                 let body = pct::render(pct, &cfg.pct);
                 // For the textual modes don't double-print the percent.
@@ -2251,10 +2254,7 @@ mod tests {
         // the CLOSED×N summary.
         let other = other_with_states(
             vec![143, 144],
-            vec![
-                (143, lite_state("CLOSED")),
-                (144, lite_state("CLOSED")),
-            ],
+            vec![(143, lite_state("CLOSED")), (144, lite_state("CLOSED"))],
         );
         let cfg = ChipsConfig::default();
         let txt = render_chips(&other, &cfg, &url(143));
