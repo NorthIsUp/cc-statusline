@@ -19,14 +19,8 @@ pub fn render(ctx: &RenderCtx, state: &mut State, cols: u32) -> String {
     let layout = cfg.layout();
     let gap = layout.gap;
 
-    // Build per-name resolved configs (default_priority unless overridden).
-    let resolve_cfg = |name: &str| -> ComponentConfig {
-        let mut c = cfg.component_config(name);
-        if c.priority == 5 && !is_user_set(cfg, name, "priority") {
-            c.priority = components::default_priority(name);
-        }
-        c
-    };
+    // Per-name config as written; `Item::new` fills in the default priority.
+    let resolve_cfg = |name: &str| -> ComponentConfig { cfg.component_config(name) };
 
     let left_names: Vec<String> = layout.left.clone();
     let right_names: Vec<String> = layout.right.clone();
@@ -91,6 +85,18 @@ pub fn render(ctx: &RenderCtx, state: &mut State, cols: u32) -> String {
         None
     };
 
+    // When the overflow row is emitted, the compact `×N` chips on line 1 is
+    // a redundant placeholder for the same chain. Zero its rendered text so
+    // line 1 doesn't carry the duplicate. Width stays as the layout engine
+    // computed it — we don't re-pack — to keep right-edge alignment stable.
+    if line2.is_some() {
+        for it in left_items.iter_mut().chain(right_items.iter_mut()) {
+            if it.name == "chips" && !it.dropped {
+                it.rendered = crate::component::Rendered::empty();
+            }
+        }
+    }
+
     let left = join_items(&left_items);
     let right = join_items(&right_items);
     let llen = vlen(&left);
@@ -133,20 +139,24 @@ fn compute_chips_overflow(
     }
     let current_w = chips.rendered.width;
     // Try the largest size first, falling back to smaller-but-still-larger
-    // sizes if the expanded form doesn't fit terminal width.
+    // sizes if a larger expansion isn't actually wider. We deliberately do
+    // not gate on cols — if the chain is too wide for the terminal, let it
+    // wrap rather than hiding the whole line.
     let mut candidate: Option<crate::component::Rendered> = None;
     for s in chips.sizes.iter().rev().copied() {
         if s <= chips.size {
             break;
         }
         let r = components::render_named(&chips.name, s, ctx).unwrap_or_default();
-        if r.width > current_w && r.width <= cols {
+        if r.width > current_w {
             candidate = Some(r);
             break;
         }
     }
     let r = candidate?;
     // Right-pad to `cols` cells so the right-edge invariant matches line 1.
+    // Skip padding when the line would already overflow cols (terminal will
+    // soft-wrap on its own).
     let pad = cols.saturating_sub(r.width) as usize;
     let mut out = r.text;
     if pad > 0 {
@@ -192,6 +202,10 @@ fn assemble(
 struct Item {
     name: String,
     cfg: ComponentConfig,
+    /// `cfg.priority` if the user set one, else `components::default_priority`.
+    /// Resolved here so an explicit `priority = 5` is honoured rather than
+    /// being indistinguishable from "unset".
+    priority: u32,
     size: Size,
     sizes: Vec<Size>, // allowed sizes, smallest → largest, filtered by cfg.sizes & min
     /// Intrinsic component sizes (full unfiltered list from `components::sizes_for`).
@@ -245,6 +259,9 @@ impl Item {
             .unwrap_or(*allowed.last().unwrap());
         Some(Self {
             name: name.into(),
+            priority: cfg
+                .priority
+                .unwrap_or_else(|| components::default_priority(name)),
             cfg: cfg.clone(),
             size: default,
             sizes: allowed,
@@ -335,7 +352,7 @@ fn shrink_one(left: &mut [Item], right: &mut [Item], ctx: &RenderCtx) -> bool {
         if it.dropped || it.size <= it.min_size() {
             continue;
         }
-        let p = it.cfg.priority;
+        let p = it.priority;
         if best.map(|(_, _, bp)| p < bp).unwrap_or(true) {
             best = Some((true, i, p));
         }
@@ -344,7 +361,7 @@ fn shrink_one(left: &mut [Item], right: &mut [Item], ctx: &RenderCtx) -> bool {
         if it.dropped || it.size <= it.min_size() {
             continue;
         }
-        let p = it.cfg.priority;
+        let p = it.priority;
         if best.map(|(_, _, bp)| p < bp).unwrap_or(true) {
             best = Some((false, i, p));
         }
@@ -382,7 +399,7 @@ fn relax_one(left: &mut [Item], right: &mut [Item], ctx: &RenderCtx) -> bool {
         if it.dropped || it.size <= it.intrinsic_min() {
             continue;
         }
-        let p = it.cfg.priority;
+        let p = it.priority;
         if best.map(|(_, _, bp)| p < bp).unwrap_or(true) {
             best = Some((true, i, p));
         }
@@ -391,7 +408,7 @@ fn relax_one(left: &mut [Item], right: &mut [Item], ctx: &RenderCtx) -> bool {
         if it.dropped || it.size <= it.intrinsic_min() {
             continue;
         }
-        let p = it.cfg.priority;
+        let p = it.priority;
         if best.map(|(_, _, bp)| p < bp).unwrap_or(true) {
             best = Some((false, i, p));
         }
@@ -422,7 +439,7 @@ fn drop_one(left: &mut [Item], right: &mut [Item]) -> bool {
         if it.dropped || it.cfg.required {
             continue;
         }
-        let p = it.cfg.priority;
+        let p = it.priority;
         if best.map(|(_, _, bp)| p < bp).unwrap_or(true) {
             best = Some((true, i, p));
         }
@@ -431,7 +448,7 @@ fn drop_one(left: &mut [Item], right: &mut [Item]) -> bool {
         if it.dropped || it.cfg.required {
             continue;
         }
-        let p = it.cfg.priority;
+        let p = it.priority;
         if best.map(|(_, _, bp)| p < bp).unwrap_or(true) {
             best = Some((false, i, p));
         }
@@ -511,16 +528,6 @@ fn build_layout_state(left: &[Item], right: &[Item], cols: u32) -> LayoutState {
     s
 }
 
-// Probe whether the user explicitly set a key in the config. Conservative —
-// returns false if we can't tell, which means default_priority kicks in.
-fn is_user_set(_cfg: &crate::config::Config, _name: &str, _key: &str) -> bool {
-    // We don't preserve original TOML structure, so assume defaults are
-    // never explicitly set. The effect: components::default_priority is
-    // always applied unless the user-supplied config has priority != 5.
-    // This is the desired behaviour — opting-in to priority=5 is rare.
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,6 +570,29 @@ mod tests {
         }
     }
 
+    /// An explicit `priority` is honoured even when it equals the old sentinel
+    /// default of 5. Previously a stub `is_user_set` always answered false, so
+    /// any 5 was overwritten by `default_priority` — silently, and `spinner`
+    /// defaults to 100, so pinning it to 5 did the opposite of what was asked.
+    #[test]
+    fn explicit_priority_is_not_overridden_by_default() {
+        let explicit = ComponentConfig {
+            priority: Some(5),
+            ..Default::default()
+        };
+        let it = Item::new("spinner", &explicit).unwrap();
+        assert_eq!(it.priority, 5, "user's explicit 5 must win");
+
+        let unset = ComponentConfig::default();
+        let it2 = Item::new("spinner", &unset).unwrap();
+        assert_eq!(
+            it2.priority,
+            components::default_priority("spinner"),
+            "unset must fall back to the component default"
+        );
+        assert_ne!(it2.priority, 5, "the two cases must be distinguishable");
+    }
+
     /// Two items with different priority. When width forces a shrink, the
     /// LOWER-priority one steps down first.
     #[test]
@@ -576,14 +606,14 @@ mod tests {
         let cfg_high = ComponentConfig {
             sizes: vec![Size::Xs, Size::Xl],
             min: Some(Size::Xs),
-            priority: 100,
+            priority: Some(100),
             required: false,
             default: Some(Size::Xl),
         };
         let cfg_low = ComponentConfig {
             sizes: vec![Size::Xs, Size::Xl],
             min: Some(Size::Xs),
-            priority: 1,
+            priority: Some(1),
             required: false,
             default: Some(Size::Xl),
         };
@@ -619,7 +649,7 @@ mod tests {
         let cfg = ComponentConfig {
             sizes: vec![Size::Xs, Size::S, Size::M, Size::L, Size::Xl],
             min: Some(Size::M),
-            priority: 1,
+            priority: Some(1),
             required: false,
             default: Some(Size::Xl),
         };
@@ -644,7 +674,7 @@ mod tests {
         let cfg = ComponentConfig {
             sizes: vec![],
             min: None,
-            priority: 5,
+            priority: Some(5),
             required: false,
             default: None,
         };
@@ -732,7 +762,7 @@ mod tests {
         let cfg = ComponentConfig {
             sizes: vec![],
             min: None,
-            priority: 5,
+            priority: Some(5),
             required: false,
             default: None,
         };
@@ -889,7 +919,7 @@ mod tests {
         let cfg_chips = ComponentConfig {
             sizes: vec![],
             min: Some(Size::Xl),
-            priority: 1,
+            priority: Some(1),
             required: false,
             default: Some(Size::Xl),
         };
@@ -991,5 +1021,42 @@ mod tests {
                 "line 2 right-padded to cols"
             );
         }
+    }
+
+    /// When the overflow row is emitted, the compact `×N` chips placeholder
+    /// must NOT also appear on line 1 — that would double-render the same
+    /// chain (one collapsed, one expanded).
+    #[test]
+    fn render_no_compact_chips_on_line1_when_overflow_emitted() {
+        unsafe {
+            std::env::set_var("CC_STATUSLINE_NF_WIDTH", "1");
+            std::env::set_var("CC_STATUSLINE_SAFETY_MARGIN", "0");
+        }
+        let git = mk_git();
+        let other = chips_other((101..=160).collect());
+        let burn = crate::transcript::BurnInfo::default();
+        let agents = AgentCount::default();
+        let cols: u32 = 80;
+        let session = mk_session(cols);
+        let ctx = RenderCtx {
+            session: &session,
+            git: &git,
+            other: &other,
+            burn: &burn,
+            agents: &agents,
+            tick: 0,
+        };
+        let mut state = State::default();
+        let line = render(&ctx, &mut state, cols);
+        let mut iter = line.lines();
+        let first = crate::vlen::strip(iter.next().unwrap_or(""));
+        let second = iter.next().expect("overflow row emitted");
+        // Line 2 carries the expanded chain.
+        assert!(second.contains("#101"), "chain on line 2: {second:?}");
+        // Line 1 must not contain the compact `×N` chip count for the chain.
+        assert!(
+            !first.contains(&format!("×{}", other.urls.len())),
+            "compact ×N chip leaked onto line 1: {first:?}"
+        );
     }
 }

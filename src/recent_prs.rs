@@ -10,6 +10,7 @@
 use crate::cache::now_epoch;
 use crate::config;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io;
@@ -24,9 +25,26 @@ pub struct RecentPrs {
     pub version: String,
     pub fetched_at: i64,
     pub locked_at: i64,
+    /// Last-observed GitHub GraphQL `rateLimit.remaining` (of 5000/hr). Drives
+    /// adaptive refresh spacing: the closer to exhaustion, the longer every
+    /// session waits before refreshing. `0` means "never observed" (a fresh
+    /// cache or a failed fetch) and is treated as healthy — the failure path's
+    /// `locked_at` backoff covers a hard rate-limit separately.
+    pub rate_remaining: i64,
     /// Map url -> {state, isDraft}. Stored as serde_json::Value-ish so we
     /// don't need a fixed schema in TOML.
     pub prs: HashMap<String, PrEntry>,
+}
+
+/// Adaptive refresh interval from the last-seen rate-limit headroom: the fewer
+/// GraphQL points left, the longer we space out refreshes (across every
+/// session, since they share this cache). `remaining == 0` = unknown/healthy.
+fn adaptive_ttl(remaining: i64, base: i64) -> i64 {
+    match remaining {
+        r if r > 0 && r < 500 => 300, // <10% of 5000 left: 5m
+        r if r > 0 && r < 2000 => 60, // <40% left: 1m
+        _ => base,                    // healthy (or unknown): base (20s)
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -39,6 +57,10 @@ pub struct PrEntry {
     /// the timestamp could not be parsed (defensive: treat unknown as
     /// "do not collapse" rather than dropping).
     pub merged_at: Option<i64>,
+    /// True iff GitHub's `autoMergeRequest` is non-null — i.e. the PR is
+    /// queued to auto-merge when checks pass.
+    #[serde(default)]
+    pub auto_merge: bool,
 }
 
 impl RecentPrs {
@@ -76,7 +98,7 @@ fn fresh(at: i64, ttl: i64) -> bool {
 /// locked. Returns immediately — the worker runs in background.
 pub fn maybe_spawn_refresh() {
     let cur = RecentPrs::load();
-    let ttl = config::config().recent_prs_ttl();
+    let ttl = adaptive_ttl(cur.rate_remaining, config::config().recent_prs_ttl());
     if fresh(cur.fetched_at, ttl) && !cur.prs.is_empty() {
         return;
     }
@@ -116,14 +138,19 @@ pub fn run_refresh() {
 
     // Re-check freshness inside the lock.
     let mut cur = RecentPrs::load();
-    let ttl = config::config().recent_prs_ttl();
+    let ttl = adaptive_ttl(cur.rate_remaining, config::config().recent_prs_ttl());
     if fresh(cur.fetched_at, ttl) && !cur.prs.is_empty() {
         return;
     }
     cur.locked_at = now_epoch();
     let _ = cur.save();
 
-    if let Some(mut prs) = fetch() {
+    // Local disk hygiene, before the fetch and regardless of whether it
+    // succeeds: a rate-limited run is exactly when the cache dir is most
+    // bloated, so this must not hang off the success path.
+    sweep_orphan_sidecars(&config::cache_dir());
+
+    if let Some((mut prs, remaining)) = fetch() {
         // Second pass: hydrate any URLs referenced by other_prs.urls in any
         // session state file that aren't already present in the freshly
         // fetched viewer.pullRequests result. This catches PRs older than
@@ -138,20 +165,57 @@ pub fn run_refresh() {
             version: crate::state::STATE_VERSION.into(),
             fetched_at: now_epoch(),
             locked_at: 0,
+            // Carry the last-seen headroom forward (0 = unobserved → healthy),
+            // so `adaptive_ttl` can space out the next round of refreshes.
+            rate_remaining: remaining.unwrap_or(cur.rate_remaining),
             prs,
         };
         let _ = new.save();
     } else {
-        // Fetch failed — clear the lock so the next render can retry, but
-        // keep the previously-cached prs intact.
-        cur.locked_at = 0;
+        // Fetch failed (commonly a rate-limit). Stamp `locked_at = now` so the
+        // debounce holds for `ttl.max(60)`s instead of re-spawning a worker on
+        // the very next render — otherwise, exactly when we're rate-limited,
+        // every live session hammers the API in a tight loop and never
+        // recovers. Keep the previously-cached prs intact.
+        cur.locked_at = now_epoch();
         let _ = cur.save();
     }
 }
 
-/// Walks every session state TOML in `cache_dir()` (excluding `recent_prs.toml`
-/// itself) and returns the union of `other_prs.urls` entries that are missing
-/// from `have`.
+/// A session file not rewritten within this window is *inactive*. A displayed
+/// session rewrites its state file on every render (~1s cadence), so 1h is a
+/// wide safety margin. Inactive sessions are ignored when hydrating chips —
+/// nobody's viewing them, so refreshing their PR state just burns API budget —
+/// even though the file is left on disk until it ages out.
+const ACTIVE_SESSION_SECS: i64 = 60 * 60;
+
+/// A session file older than this is a *dead* session and is deleted outright.
+/// Kept longer than `ACTIVE_SESSION_SECS` so a session resumed within the day
+/// still finds its chip-URL history, without us paying to refresh it while idle.
+/// Without this, dead sessions accumulate indefinitely (hundreds observed).
+const STALE_SESSION_SECS: i64 = 24 * 60 * 60;
+
+enum SessionAge {
+    Active, // touched within the hour: a live viewer — refresh its chips
+    Idle,   // 1h–24h: keep the file, but don't spend API refreshing it
+    Dead,   // >24h: delete
+}
+
+fn classify_age(age_secs: i64) -> SessionAge {
+    if age_secs > STALE_SESSION_SECS {
+        SessionAge::Dead
+    } else if age_secs > ACTIVE_SESSION_SECS {
+        SessionAge::Idle
+    } else {
+        SessionAge::Active
+    }
+}
+
+/// Walks every *active* session state TOML in `cache_dir()` (excluding
+/// `recent_prs.toml` itself) and returns the union of `other_prs.urls` entries
+/// that are missing from `have`. Sessions idle >1h are ignored (no live viewer
+/// to serve); dead sessions >24h are additionally deleted. Either way their
+/// chips don't drive a fetch — that fan-out is what exhausts the 5000/hr budget.
 fn collect_missing_urls(have: &HashMap<String, PrEntry>) -> Vec<String> {
     let dir = config::cache_dir();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -166,6 +230,19 @@ fn collect_missing_urls(have: &HashMap<String, PrEntry>) -> Vec<String> {
         }
         if path.file_name().and_then(|s| s.to_str()) == Some("recent_prs.toml") {
             continue;
+        }
+        // Ignore inactive sessions (no live viewer); delete truly dead ones.
+        let mtime = match crate::cache::mtime(&path) {
+            Some(m) => m,
+            None => continue,
+        };
+        match classify_age(now_epoch() - mtime) {
+            SessionAge::Dead => {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            SessionAge::Idle => continue,
+            SessionAge::Active => {}
         }
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
@@ -182,6 +259,38 @@ fn collect_missing_urls(have: &HashMap<String, PrEntry>) -> Vec<String> {
         }
     }
     seen.into_iter().collect()
+}
+
+/// Delete `<id>.toml.lock` / `<id>.toml.tmp` sidecars whose `<id>.toml` is
+/// gone. The session GC above only ever removed the state file, so its lock
+/// outlived it forever (1324 orphans against 18 live states observed).
+///
+/// Orphan-only, and dead-old on top: a live session rewrites its state file
+/// every render, so a missing `.toml` means nothing can still be holding the
+/// matching lock. Deleting one that *was* held would let a second worker lock
+/// a fresh inode and race the holder.
+fn sweep_orphan_sidecars(dir: &std::path::Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match path.extension().and_then(|s| s.to_str()) {
+            Some("lock") | Some("tmp") => {}
+            _ => continue,
+        }
+        // `<id>.toml.lock` → `<id>.toml`; skip anything not shaped that way.
+        let owner = path.with_extension("");
+        if owner.extension().and_then(|s| s.to_str()) != Some("toml") || owner.exists() {
+            continue;
+        }
+        if let Some(m) = crate::cache::mtime(&path) {
+            if matches!(classify_age(now_epoch() - m), SessionAge::Dead) {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
 }
 
 /// Parse `https://github.com/OWNER/REPO/pull/N` (with optional trailing
@@ -210,16 +319,19 @@ pub(crate) fn parse_pr_url(url: &str) -> Option<(String, String, u64)> {
 }
 
 /// Batched PR-by-(owner,repo,number) lookup using aliased `repository.pullRequest`
-/// fields. Splits into chunks of 50 to keep below GraphQL complexity caps and
-/// to make per-batch failure recoverable. A failed alias inside an otherwise-
-/// successful batch is skipped silently.
+/// fields. Each chunk is one GraphQL query of single-object lookups (no
+/// `first`/`last` connection), so it costs ~1 rate-limit point regardless of
+/// how many aliases it packs — fewer, larger chunks means fewer points. 100
+/// stays well within GraphQL's node/complexity caps while halving the query
+/// count vs the old 50. A failed alias inside an otherwise-successful batch is
+/// skipped silently.
 fn fetch_by_urls(urls: &[String]) -> HashMap<String, PrEntry> {
     let mut out = HashMap::new();
     let parsed: Vec<(String, (String, String, u64))> = urls
         .iter()
         .filter_map(|u| parse_pr_url(u).map(|p| (u.clone(), p)))
         .collect();
-    for chunk in parsed.chunks(50) {
+    for chunk in parsed.chunks(100) {
         if let Some(map) = fetch_chunk(chunk) {
             out.extend(map);
         }
@@ -236,22 +348,12 @@ fn fetch_chunk(chunk: &[(String, (String, String, u64))]) -> Option<HashMap<Stri
             continue;
         }
         q.push_str(&format!(
-            "  a{i}: repository(owner: \"{owner}\", name: \"{repo}\") {{ pullRequest(number: {number}) {{ url state isDraft number mergedAt }} }}\n"
+            "  a{i}: repository(owner: \"{owner}\", name: \"{repo}\") {{ pullRequest(number: {number}) {{ url state isDraft number mergedAt autoMergeRequest {{ __typename }} }} }}\n"
         ));
     }
     q.push_str("}\n");
 
-    let out = Command::new("gh")
-        .args(["api", "graphql", "-f", &format!("query={q}")])
-        .env_remove("GITHUB_TOKEN")
-        .env_remove("GH_TOKEN")
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if out.stdout.is_empty() {
-        return None;
-    }
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let v = crate::github::graphql(&q)?;
     let data = v.get("data")?.as_object()?;
     let mut map = HashMap::new();
     for (_alias, val) in data {
@@ -274,6 +376,10 @@ fn fetch_chunk(chunk: &[(String, (String, String, u64))]) -> Option<HashMap<Stri
             .get("mergedAt")
             .and_then(|x| x.as_str())
             .and_then(crate::input::ts_to_epoch);
+        let auto_merge = pr
+            .get("autoMergeRequest")
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
         map.insert(
             url,
             PrEntry {
@@ -281,10 +387,119 @@ fn fetch_chunk(chunk: &[(String, (String, String, u64))]) -> Option<HashMap<Stri
                 is_draft,
                 number,
                 merged_at,
+                auto_merge,
             },
         );
     }
     Some(map)
+}
+
+const QUERY: &str = r#"query {
+  rateLimit { remaining }
+  viewer {
+    pullRequests(first: 100, orderBy: {field: UPDATED_AT, direction: DESC}, states: [OPEN, MERGED, CLOSED]) {
+      nodes { url state isDraft number mergedAt autoMergeRequest { __typename } }
+    }
+  }
+}"#;
+
+/// Returns `(prs, rateLimit.remaining)`. `remaining` is `None` when the field
+/// is absent (older API / unexpected shape); `rateLimit` itself costs 0 points.
+fn fetch() -> Option<(HashMap<String, PrEntry>, Option<i64>)> {
+    let v = crate::github::graphql(QUERY)?;
+    let remaining = v
+        .pointer("/data/rateLimit/remaining")
+        .and_then(Value::as_i64);
+    let nodes = v
+        .get("data")?
+        .get("viewer")?
+        .get("pullRequests")?
+        .get("nodes")?
+        .as_array()?;
+    let mut map = HashMap::with_capacity(nodes.len());
+    for n in nodes {
+        // Skip a node we can't key, rather than `?`-ing out of the whole
+        // fetch: one unusable entry used to discard all 100 and leave every
+        // chip uncoloured until the next TTL.
+        let url = match n.get("url").and_then(|x| x.as_str()) {
+            Some(u) => u.to_string(),
+            None => continue,
+        };
+        let state = n
+            .get("state")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let is_draft = n.get("isDraft").and_then(|x| x.as_bool()).unwrap_or(false);
+        let number = n.get("number").and_then(|x| x.as_u64()).unwrap_or(0);
+        let merged_at = n
+            .get("mergedAt")
+            .and_then(|x| x.as_str())
+            .and_then(crate::input::ts_to_epoch);
+        let auto_merge = n
+            .get("autoMergeRequest")
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
+        map.insert(
+            url,
+            PrEntry {
+                state,
+                is_draft,
+                number,
+                merged_at,
+                auto_merge,
+            },
+        );
+    }
+    Some((map, remaining))
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// Backdate a file's mtime by `secs` so `classify_age` sees it as dead.
+    fn backdate(p: &Path, secs: i64) {
+        let t = (now_epoch() - secs) as libc::time_t;
+        let tv = libc::timeval {
+            tv_sec: t,
+            tv_usec: 0,
+        };
+        let times = [tv, tv];
+        let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::utimes(c.as_ptr(), times.as_ptr()) }, 0);
+    }
+
+    #[test]
+    fn sweeps_only_dead_orphan_sidecars() {
+        let dir = std::env::temp_dir().join(format!("cc-sweep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = STALE_SESSION_SECS + 60;
+
+        let orphan = dir.join("a.toml.lock");
+        let orphan_tmp = dir.join("b.toml.tmp");
+        let owned = dir.join("c.toml.lock");
+        let owner = dir.join("c.toml");
+        let fresh_orphan = dir.join("d.toml.lock");
+        for p in [&orphan, &orphan_tmp, &owned, &owner, &fresh_orphan] {
+            std::fs::write(p, "").unwrap();
+        }
+        // c's owner still exists → its lock may be held; d is orphaned but new.
+        for p in [&orphan, &orphan_tmp, &owned, &owner] {
+            backdate(p, old);
+        }
+
+        sweep_orphan_sidecars(&dir);
+
+        assert!(!orphan.exists(), "dead orphan lock must be swept");
+        assert!(!orphan_tmp.exists(), "dead orphan tmp must be swept");
+        assert!(owned.exists(), "lock with a live owner must survive");
+        assert!(owner.exists(), "state file is not this sweep's business");
+        assert!(fresh_orphan.exists(), "recent orphan must survive");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
@@ -312,6 +527,36 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_ttl_tiers() {
+        // healthy or unobserved (0) → base; low → 1m; very low → 5m.
+        assert_eq!(adaptive_ttl(0, 20), 20);
+        assert_eq!(adaptive_ttl(5000, 20), 20);
+        assert_eq!(adaptive_ttl(2000, 20), 20);
+        assert_eq!(adaptive_ttl(1999, 20), 60);
+        assert_eq!(adaptive_ttl(500, 20), 60);
+        assert_eq!(adaptive_ttl(499, 20), 300);
+        assert_eq!(adaptive_ttl(1, 20), 300);
+    }
+
+    #[test]
+    fn classify_age_windows() {
+        assert!(matches!(classify_age(0), SessionAge::Active));
+        assert!(matches!(
+            classify_age(ACTIVE_SESSION_SECS),
+            SessionAge::Active
+        ));
+        assert!(matches!(
+            classify_age(ACTIVE_SESSION_SECS + 1),
+            SessionAge::Idle
+        ));
+        assert!(matches!(classify_age(STALE_SESSION_SECS), SessionAge::Idle));
+        assert!(matches!(
+            classify_age(STALE_SESSION_SECS + 1),
+            SessionAge::Dead
+        ));
+    }
+
+    #[test]
     fn parse_pr_url_with_dashes_dots() {
         assert_eq!(
             parse_pr_url("https://github.com/some-org/my.repo/pull/7"),
@@ -327,57 +572,4 @@ mod tests {
         assert!(parse_pr_url("https://github.com/foo/bar/pull/abc").is_none());
         assert!(parse_pr_url("not a url").is_none());
     }
-}
-
-const QUERY: &str = r#"query {
-  viewer {
-    pullRequests(first: 100, orderBy: {field: UPDATED_AT, direction: DESC}, states: [OPEN, MERGED, CLOSED]) {
-      nodes { url state isDraft number mergedAt }
-    }
-  }
-}"#;
-
-fn fetch() -> Option<HashMap<String, PrEntry>> {
-    let out = Command::new("gh")
-        .args(["api", "graphql", "-f", &format!("query={QUERY}")])
-        .env_remove("GITHUB_TOKEN")
-        .env_remove("GH_TOKEN")
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() || out.stdout.is_empty() {
-        return None;
-    }
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    let nodes = v
-        .get("data")?
-        .get("viewer")?
-        .get("pullRequests")?
-        .get("nodes")?
-        .as_array()?;
-    let mut map = HashMap::with_capacity(nodes.len());
-    for n in nodes {
-        let url = n.get("url").and_then(|x| x.as_str())?.to_string();
-        let state = n
-            .get("state")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string();
-        let is_draft = n.get("isDraft").and_then(|x| x.as_bool()).unwrap_or(false);
-        let number = n.get("number").and_then(|x| x.as_u64()).unwrap_or(0);
-        let merged_at = n
-            .get("mergedAt")
-            .and_then(|x| x.as_str())
-            .and_then(crate::input::ts_to_epoch);
-        map.insert(
-            url,
-            PrEntry {
-                state,
-                is_draft,
-                number,
-                merged_at,
-            },
-        );
-    }
-    Some(map)
 }

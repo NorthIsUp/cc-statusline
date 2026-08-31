@@ -46,7 +46,7 @@ nerd_font_width     = 2             # cell width of Nerd Font PUA glyphs
 pr_cache_ttl        = 60            # seconds, current-branch PR
 other_cache_ttl     = 600           # seconds, "other PRs" URL list
 recent_prs_ttl      = 20            # seconds, global gh api graphql cache
-debug_focus_log     = true
+debug_focus_log     = false         # unrotated ~1 line/s log; opt in to debug
 spinner             = "compact"     # or "epoch-N" (last N digits of epoch)
 ```
 
@@ -138,9 +138,13 @@ struct change must come with a regenerated `config.schema.json`.
 2. Bump `version` in `Cargo.toml`.
 3. Commit and push to `main`.
 
-The `release.yml` workflow watches Cargo.toml on main, reads the new version,
-builds binaries for 5 targets, drops a `vX.Y.Z` tag, and publishes a GitHub
-release with the matching CHANGELOG section as the body and SHA256 checksums.
+The `ci.yml` workflow tests every push and pull request; on main it also reads
+the new version, builds the two Apple targets, drops a `vX.Y.Z` tag, and
+publishes a GitHub release with the matching CHANGELOG section as the body and
+SHA256 checksums.
+
+macOS only: the statusline links `objc2` (NSWorkspace, NSAppleScript) and calls
+Darwin-only `proc_pidinfo`/`devname`, so it does not build for Linux or Windows.
 
 ## License
 

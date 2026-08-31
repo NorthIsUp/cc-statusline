@@ -53,7 +53,23 @@ pub fn build_with_state(
 }
 
 pub fn effective_cols(input: u32) -> u32 {
-    let mut cols = if input > 0 { input } else { tty_cols() };
+    // Source priority — first that produces a usable number wins:
+    //   1. /dev/tty winsize (cheap; rarely usable in Claude's hook
+    //      subprocess but free to try).
+    //   2. Ancestor pty: walk the parent chain via `proc_pidinfo` and ioctl
+    //      the first ancestor with a real controlling tty — works in
+    //      Claude's hook subprocess and is live on resize.
+    //   3. JSON `terminal.width` from Claude Code (not currently sent;
+    //      future-proofing).
+    //   4. $COLUMNS / 120 fallback.
+    //
+    // All width probing is now pure syscall (ioctl TIOCGWINSZ +
+    // proc_pidinfo) — no `ps`/`stty`/`tput` subprocesses on the render path.
+    let mut cols = winsize_cols("/dev/tty")
+        .or_else(ancestor_tty_cols)
+        .or_else(|| (input > 0).then_some(input))
+        .or_else(env_cols)
+        .unwrap_or(120);
     let margin: u32 = std::env::var("CC_STATUSLINE_SAFETY_MARGIN")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -62,44 +78,72 @@ pub fn effective_cols(input: u32) -> u32 {
     cols.max(20)
 }
 
-fn tty_cols() -> u32 {
-    use std::process::{Command, Stdio};
-    let open_tty = || std::fs::OpenOptions::new().read(true).open("/dev/tty").ok();
-    if let Some(tty) = open_tty() {
-        if let Ok(out) = Command::new("stty")
-            .arg("size")
-            .stdin(Stdio::from(tty))
-            .stderr(Stdio::null())
-            .output()
-        {
-            if let Ok(s) = String::from_utf8(out.stdout) {
-                if let Some(c) = s.split_whitespace().nth(1) {
-                    if let Ok(n) = c.parse::<u32>() {
-                        return n;
-                    }
-                }
+/// `(ppid, controlling-tty dev_t)` for `pid` via `proc_pidinfo`'s
+/// `PROC_PIDTBSDINFO` flavor. `e_tdev` is `NODEV` (-1) when the process has
+/// no controlling terminal.
+fn proc_info(pid: u32) -> Option<(u32, libc::dev_t)> {
+    let mut bi: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let sz = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut bi as *mut _ as *mut libc::c_void,
+            sz,
+        )
+    };
+    if n != sz {
+        return None;
+    }
+    Some((bi.pbi_ppid, bi.e_tdev as libc::dev_t))
+}
+
+/// Walk the parent-PID chain (us → claude → shell → terminal app) looking
+/// for an ancestor with a real controlling tty, then read its winsize.
+fn ancestor_tty_cols() -> Option<u32> {
+    let mut pid = std::process::id();
+    for _ in 0..16 {
+        let (ppid, tdev) = proc_info(pid)?;
+        if tdev != -1 {
+            if let Some(c) = winsize_for_dev(tdev) {
+                return Some(c);
             }
         }
-    }
-    if let Some(tty) = open_tty() {
-        let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
-        if let Ok(out) = Command::new("tput")
-            .args(["-T", &term, "cols"])
-            .stdin(Stdio::from(tty))
-            .stderr(Stdio::null())
-            .output()
-        {
-            if let Ok(s) = String::from_utf8(out.stdout) {
-                if let Ok(n) = s.trim().parse::<u32>() {
-                    return n;
-                }
-            }
+        if ppid <= 1 {
+            break;
         }
+        pid = ppid;
     }
-    if let Ok(c) = std::env::var("COLUMNS") {
-        if let Ok(n) = c.parse::<u32>() {
-            return n;
-        }
+    None
+}
+
+/// Map a controlling-tty `dev_t` to `/dev/<name>` (via `devname`) and read
+/// its winsize.
+fn winsize_for_dev(dev: libc::dev_t) -> Option<u32> {
+    let name = unsafe { libc::devname(dev, libc::S_IFCHR as libc::mode_t) };
+    if name.is_null() {
+        return None;
     }
-    120
+    let cstr = unsafe { std::ffi::CStr::from_ptr(name) };
+    let path = format!("/dev/{}", cstr.to_str().ok()?);
+    winsize_cols(&path)
+}
+
+/// `ioctl(TIOCGWINSZ)` on `path` → column count. Replaces `stty size`:
+/// opening the specific tty path queries that tty's geometry directly, even
+/// when `/dev/tty` is detached in a hook subprocess.
+fn winsize_cols(path: &str) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let f = std::fs::OpenOptions::new().read(true).open(path).ok()?;
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::ioctl(f.as_raw_fd(), libc::TIOCGWINSZ, &mut ws) };
+    if rc != 0 || ws.ws_col == 0 {
+        return None;
+    }
+    Some(ws.ws_col as u32)
+}
+
+fn env_cols() -> Option<u32> {
+    std::env::var("COLUMNS").ok()?.parse().ok()
 }

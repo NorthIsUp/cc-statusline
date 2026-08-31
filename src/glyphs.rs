@@ -44,7 +44,8 @@ pub const FG_CYAN: &str = "\x1b[36m";
 pub const FG_MAGENTA: &str = "\x1b[35m";
 
 // GitHub PR-state palette
-pub const FG_GH_OPEN: &str = "\x1b[38;5;34m";
+pub const FG_GH_OPEN: &str = "\x1b[38;5;34m"; // #00af00 ≈ open, no automerge
+pub const FG_GH_AUTO: &str = "\x1b[38;5;120m"; // #87ff87 ≈ open + automerge queued
 pub const FG_GH_MERGED: &str = "\x1b[38;5;99m";
 pub const FG_GH_CLOSED: &str = "\x1b[38;5;167m";
 pub const FG_GH_DRAFT: &str = "\x1b[38;5;102m";

@@ -4,7 +4,7 @@
 // 3-5 size variants. Registry-style `render_named` dispatch lives at the
 // bottom — keeps the layout engine ignorant of component types.
 
-use crate::component::{Component, RenderCtx, Rendered, Size};
+use crate::component::{Component, ComponentConfig, RenderCtx, Rendered, Size};
 use crate::git::CiState;
 use crate::glyphs::*;
 use crate::pct::{self, PctConfig, PctMode};
@@ -74,11 +74,12 @@ fn worktree_suffix(ctx: &RenderCtx) -> String {
     String::new()
 }
 
-fn pr_state_color(state: &str, is_draft: bool) -> &'static str {
+fn pr_state_color(state: &str, is_draft: bool, auto_merge: bool) -> &'static str {
     match state {
         "MERGED" => FG_GH_MERGED,
         "CLOSED" => FG_GH_CLOSED,
         "OPEN" if is_draft => FG_GH_DRAFT,
+        "OPEN" if auto_merge => FG_GH_AUTO,
         "OPEN" => FG_GH_OPEN,
         _ => DIM,
     }
@@ -160,7 +161,11 @@ impl Component for PrIcon {
             return Rendered::empty();
         }
         let g = pr_state_glyph(&ctx.git.pr.state, ctx.git.pr.is_draft);
-        let c = pr_state_color(&ctx.git.pr.state, ctx.git.pr.is_draft);
+        let c = pr_state_color(
+            &ctx.git.pr.state,
+            ctx.git.pr.is_draft,
+            ctx.git.pr.auto_merge(),
+        );
         Rendered::from_text(format!("{c}{g}{RESET}"))
     }
 }
@@ -228,7 +233,11 @@ impl Component for PrNum {
             Some(n) => n,
             None => return Rendered::empty(),
         };
-        let c = pr_state_color(&ctx.git.pr.state, ctx.git.pr.is_draft);
+        let c = pr_state_color(
+            &ctx.git.pr.state,
+            ctx.git.pr.is_draft,
+            ctx.git.pr.auto_merge(),
+        );
         Rendered::from_text(format!("{c}#{n}{RESET}"))
     }
 }
@@ -419,11 +428,22 @@ pub struct ChipsConfig {
     /// (gt) bypasses the filter entirely — stacked PRs are by definition
     /// relevant.
     pub collapse_merged_after_hours: u32,
+    /// Cap the number of MERGED chips that survive the age filter. When the
+    /// kept-merged count exceeds this, the oldest-merged extras (by
+    /// `merged_at`) are collapsed regardless of age. The current branch's PR
+    /// is never collapsed. `0` disables the cap. Stack mode bypasses this
+    /// (along with the age filter).
+    pub max_merged_chips: u32,
     /// When the merge-age filter drops ≥1 merged PRs from the chain, prepend
     /// a `<merged_glyph>×N` summary chip indicating how many were collapsed.
     /// Set to `false` to suppress. Stack mode bypasses the filter, so the
     /// summary chip never renders there.
     pub merged_summary: bool,
+    /// Collapse all CLOSED chips (other than the current branch's PR) into a
+    /// single `<closed_glyph>×N` summary chip. Closed PRs are rarely
+    /// individually interesting; bunching them keeps the chain short. Set to
+    /// `false` to render each CLOSED chip individually. Stack mode bypasses.
+    pub closed_summary: bool,
     #[serde(flatten)]
     pub common: crate::component::ComponentConfig,
 }
@@ -437,7 +457,9 @@ impl Default for ChipsConfig {
             force_stack: false,
             stack_refresh_ttl: 60,
             collapse_merged_after_hours: 36,
+            max_merged_chips: 3,
             merged_summary: true,
+            closed_summary: true,
             common: crate::component::ComponentConfig::default(),
         }
     }
@@ -459,17 +481,22 @@ fn filter_collapsed_merged(
     urls: &[String],
     states: &std::collections::HashMap<String, crate::transcript::PrStateLite>,
     cutoff_hours: u32,
+    max_merged: u32,
     current_url: &str,
     bypass: bool,
     now: i64,
 ) -> CollapsedMergedFilter {
-    if bypass || cutoff_hours == 0 {
+    if bypass {
         return CollapsedMergedFilter {
             kept: urls.to_vec(),
             dropped: 0,
         };
     }
-    let cutoff = now - (cutoff_hours as i64) * 3600;
+    let cutoff = if cutoff_hours == 0 {
+        i64::MIN
+    } else {
+        now - (cutoff_hours as i64) * 3600
+    };
     let mut kept = Vec::with_capacity(urls.len());
     let mut dropped = 0usize;
     for u in urls {
@@ -490,12 +517,50 @@ fn filter_collapsed_merged(
             dropped += 1;
         }
     }
+
+    // Count cap: if more than max_merged MERGED chips survived (excluding the
+    // current PR), drop the oldest-merged ones. Unknown timestamps sort last
+    // (i.e. survive the cap), since they could be very recent.
+    if max_merged > 0 {
+        let max = max_merged as usize;
+        let merged_indices: Vec<usize> = kept
+            .iter()
+            .enumerate()
+            .filter(|(_, u)| {
+                u.as_str() != current_url
+                    && matches!(states.get(u.as_str()), Some(s) if s.state == "MERGED")
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if merged_indices.len() > max {
+            let mut sorted = merged_indices.clone();
+            // Newest first; entries with no merged_at sort newest (kept).
+            sorted.sort_by_key(|&i| {
+                std::cmp::Reverse(
+                    states
+                        .get(kept[i].as_str())
+                        .and_then(|s| s.merged_at)
+                        .unwrap_or(i64::MAX),
+                )
+            });
+            let to_drop: std::collections::HashSet<usize> = sorted.into_iter().skip(max).collect();
+            let new_kept: Vec<String> = kept
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !to_drop.contains(i))
+                .map(|(_, u)| u.clone())
+                .collect();
+            dropped += to_drop.len();
+            kept = new_kept;
+        }
+    }
+
     CollapsedMergedFilter { kept, dropped }
 }
 
 fn pr_color_for(other: &crate::transcript::OtherPrs, url: &str) -> &'static str {
     match other.states.get(url) {
-        Some(s) => pr_state_color(&s.state, s.is_draft),
+        Some(s) => pr_state_color(&s.state, s.is_draft, s.auto_merge),
         None => DIM,
     }
 }
@@ -610,6 +675,7 @@ impl Component for Chips {
             &ctx.other.urls,
             &ctx.other.states,
             cfg.collapse_merged_after_hours,
+            cfg.max_merged_chips,
             &ctx.git.pr.url,
             bypass_filter,
             now,
@@ -649,7 +715,34 @@ impl Component for Chips {
                         parts.push(' ');
                         parts.push_str(&format!("{FG_GH_MERGED}{MERGED}×{dropped_count}{RESET}"));
                     }
+                    let closed_count = if cfg.closed_summary {
+                        filtered_urls
+                            .iter()
+                            .filter(|u| {
+                                u.as_str() != ctx.git.pr.url
+                                    && matches!(
+                                        ctx.other.states.get(u.as_str()),
+                                        Some(s) if s.state == "CLOSED"
+                                    )
+                            })
+                            .count()
+                    } else {
+                        0
+                    };
+                    if closed_count > 0 {
+                        parts.push(' ');
+                        parts.push_str(&format!("{FG_GH_CLOSED}{PR_CLOSED}×{closed_count}{RESET}"));
+                    }
                     for u in &filtered_urls {
+                        if cfg.closed_summary
+                            && u.as_str() != ctx.git.pr.url
+                            && matches!(
+                                ctx.other.states.get(u.as_str()),
+                                Some(s) if s.state == "CLOSED"
+                            )
+                        {
+                            continue;
+                        }
                         parts.push(' ');
                         parts.push_str(&render_chip(ctx.other, u));
                     }
@@ -972,16 +1065,18 @@ impl Component for CtxBar {
                     mode: PctMode::Dots,
                     ..cfg.pct.clone()
                 };
-                Rendered::from_text(pct::render(pct, &dots_cfg))
+                Rendered::from_text(format!("{DIM}{CTX}{RESET} {}", pct::render(pct, &dots_cfg)))
             }
-            Size::S => Rendered::from_text(pct::render(pct, &cfg.pct)),
+            Size::S => {
+                Rendered::from_text(format!("{DIM}{CTX}{RESET} {}", pct::render(pct, &cfg.pct)))
+            }
             Size::M => {
                 let body = pct::render(pct, &cfg.pct);
                 // For the textual modes don't double-print the percent.
                 if matches!(cfg.pct.mode, PctMode::Percent | PctMode::Float) {
-                    Rendered::from_text(body)
+                    Rendered::from_text(format!("{DIM}{CTX}{RESET} {body}"))
                 } else {
-                    Rendered::from_text(format!("{body} {pct}%"))
+                    Rendered::from_text(format!("{DIM}{CTX}{RESET} {body} {pct}%"))
                 }
             }
             Size::L => {
@@ -1011,8 +1106,7 @@ impl Component for CtxBar {
 pub struct Loc;
 
 fn location_icon() -> String {
-    let env = std::env::vars().collect::<std::collections::HashMap<_, _>>();
-    let has = |k: &str| env.get(k).filter(|v| !v.is_empty()).is_some();
+    let has = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
     if has("SSH_CONNECTION") || has("SSH_CLIENT") || has("SSH_TTY") {
         return format!("{FG_YELLOW}{SSH_TERM}{RESET}");
     }
@@ -1157,135 +1251,152 @@ pub fn quotas_bucket_kind(name: &str) -> Option<BucketKind> {
         .and_then(BucketKind::from_suffix)
 }
 
-// ─── registry-style dispatch ────────────────────────────────────────────
+// ─── registry ───────────────────────────────────────────────────────────
+
+/// One row per component: everything the layout engine needs to know about it.
+///
+/// This is the single place a component is registered. It used to take five
+/// parallel `match name` arms — render, sizes, default size, priority, and the
+/// config-block lookup over in `config.rs` — so adding a component meant
+/// editing five tables and silently misbehaving if you missed one.
+///
+/// The function-pointer fields exist because trait methods can't be called in
+/// a `static` initializer; a non-capturing closure coerces to `fn` and can.
+pub struct Entry {
+    pub name: &'static str,
+    sizes: fn() -> &'static [Size],
+    default_size: fn() -> Size,
+    /// Higher = shrunk LAST. Keep important visual cues (spinner, ctx_bar,
+    /// model, branch) high and nice-to-haves (chips, burn, agents) low.
+    priority: u32,
+    render: fn(Size, &RenderCtx) -> Rendered,
+    /// The `[name]` block's common config, pulled out of the parsed `Config`.
+    common: fn(&crate::config::Config) -> ComponentConfig,
+}
+
+/// Shorthand for a component whose `[name]` block is a plain `ComponentConfig`
+/// held in an `Option` field on `Config`, and which takes no extension config.
+macro_rules! plain {
+    ($name:literal, $ty:ident, $priority:expr, $field:ident) => {
+        Entry {
+            name: $name,
+            sizes: <$ty as Component>::sizes,
+            default_size: <$ty as Component>::default_size,
+            priority: $priority,
+            render: |s, ctx| $ty.render(s, &(), ctx),
+            common: |c| c.$field.clone().unwrap_or_default(),
+        }
+    };
+}
+
+static REGISTRY: &[Entry] = &[
+    plain!("repo", Repo, 20, repo),
+    plain!("branch", Branch, 75, branch),
+    plain!("pr_icon", PrIcon, 70, pr_icon),
+    plain!("pr_num", PrNum, 65, pr_num),
+    plain!("ci", Ci, 50, ci),
+    plain!("review", Review, 45, review),
+    plain!("comments", Comments, 25, comments),
+    plain!("dirty", Dirty, 35, dirty),
+    plain!("ahead", Ahead, 30, ahead),
+    plain!("behind", Behind, 30, behind),
+    plain!("ticket", Ticket, 40, ticket),
+    Entry {
+        name: "chips",
+        sizes: <Chips as Component>::sizes,
+        default_size: <Chips as Component>::default_size,
+        priority: 5,
+        render: |s, ctx| Chips.render(s, &crate::config::config().chips, ctx),
+        common: |c| c.chips.common.clone(),
+    },
+    Entry {
+        name: "burn",
+        sizes: <Burn as Component>::sizes,
+        default_size: <Burn as Component>::default_size,
+        priority: 8,
+        render: |s, ctx| Burn.render(s, &crate::config::config().burn, ctx),
+        common: |c| c.burn.common.clone(),
+    },
+    plain!("agents", Agents, 10, agents),
+    Entry {
+        name: "quotas",
+        sizes: <Quotas as Component>::sizes,
+        default_size: <Quotas as Component>::default_size,
+        priority: 15,
+        render: |s, ctx| Quotas.render(s, &crate::config::config().quotas, ctx),
+        common: |c| c.quotas.common.clone(),
+    },
+    Entry {
+        name: "ctx_bar",
+        sizes: <CtxBar as Component>::sizes,
+        default_size: <CtxBar as Component>::default_size,
+        priority: 90,
+        render: |s, ctx| CtxBar.render(s, &crate::config::config().ctx_bar, ctx),
+        common: |c| c.ctx_bar.common.clone(),
+    },
+    plain!("loc", Loc, 60, loc),
+    plain!("model", Model, 80, model),
+    plain!("effort", Effort, 55, effort),
+    plain!("spinner", Spinner, 100, spinner_cfg),
+];
+
+/// The registry row for `name`. `quotas.<bucket>` pseudo-components share the
+/// `quotas` row for sizes and rendering shape; only their priority and config
+/// block differ, which `default_priority` and `Config::component_config`
+/// handle on their own.
+fn entry(name: &str) -> Option<&'static Entry> {
+    REGISTRY
+        .iter()
+        .find(|e| e.name == name)
+        .or_else(|| quotas_bucket_kind(name).and(REGISTRY.iter().find(|e| e.name == "quotas")))
+}
+
+/// Every registered component name, in registry order.
+pub fn all_names() -> impl Iterator<Item = &'static str> {
+    REGISTRY.iter().map(|e| e.name)
+}
 
 /// Render a component by name at the given size. Returns `None` if the name
 /// is not a registered component.
 pub fn render_named(name: &str, size: Size, ctx: &RenderCtx) -> Option<Rendered> {
-    let cfg = crate::config::config();
-    Some(match name {
-        "repo" => Repo.render(size, &(), ctx),
-        "branch" => Branch.render(size, &(), ctx),
-        "pr_icon" => PrIcon.render(size, &(), ctx),
-        "pr_num" => PrNum.render(size, &(), ctx),
-        "ci" => Ci.render(size, &(), ctx),
-        "review" => Review.render(size, &(), ctx),
-        "comments" => Comments.render(size, &(), ctx),
-        "dirty" => Dirty.render(size, &(), ctx),
-        "ahead" => Ahead.render(size, &(), ctx),
-        "behind" => Behind.render(size, &(), ctx),
-        "ticket" => Ticket.render(size, &(), ctx),
-        "chips" => Chips.render(size, &cfg.chips, ctx),
-        "burn" => Burn.render(size, &cfg.burn, ctx),
-        "agents" => Agents.render(size, &(), ctx),
-        "quotas" => Quotas.render(size, &cfg.quotas, ctx),
-        n if quotas_bucket_kind(n).is_some() => {
-            let kind = quotas_bucket_kind(n).unwrap();
-            match render_one_bucket(&cfg.quotas, kind, ctx) {
-                Some(text) => Rendered::from_text(text),
-                None => Rendered::empty(),
-            }
-        }
-        "ctx_bar" => CtxBar.render(size, &cfg.ctx_bar, ctx),
-        "loc" => Loc.render(size, &(), ctx),
-        "model" => Model.render(size, &(), ctx),
-        "effort" => Effort.render(size, &(), ctx),
-        "spinner" => Spinner.render(size, &(), ctx),
-        _ => return None,
-    })
+    // A `quotas.<bucket>` row renders one bucket rather than the whole block.
+    if let Some(kind) = quotas_bucket_kind(name) {
+        let cfg = crate::config::config();
+        return Some(match render_one_bucket(&cfg.quotas, kind, ctx) {
+            Some(text) => Rendered::from_text(text),
+            None => Rendered::empty(),
+        });
+    }
+    let e = entry(name)?;
+    Some((e.render)(size, ctx))
 }
-
-/// All known component names — used for default layouts and config validation.
-pub const ALL_NAMES: &[&str] = &[
-    "repo", "branch", "pr_icon", "pr_num", "ci", "review", "comments", "dirty", "ahead", "behind",
-    "ticket", "chips", "burn", "agents", "quotas", "ctx_bar", "loc", "model", "effort", "spinner",
-];
 
 /// Sizes a named component supports. Returns `None` if unknown.
 pub fn sizes_for(name: &str) -> Option<&'static [Size]> {
-    Some(match name {
-        "repo" => Repo::sizes(),
-        "branch" => Branch::sizes(),
-        "pr_icon" => PrIcon::sizes(),
-        "pr_num" => PrNum::sizes(),
-        "ci" => Ci::sizes(),
-        "review" => Review::sizes(),
-        "comments" => Comments::sizes(),
-        "dirty" => Dirty::sizes(),
-        "ahead" => Ahead::sizes(),
-        "behind" => Behind::sizes(),
-        "ticket" => Ticket::sizes(),
-        "chips" => Chips::sizes(),
-        "burn" => Burn::sizes(),
-        "agents" => Agents::sizes(),
-        "quotas" => Quotas::sizes(),
-        n if quotas_bucket_kind(n).is_some() => Quotas::sizes(),
-        "ctx_bar" => CtxBar::sizes(),
-        "loc" => Loc::sizes(),
-        "model" => Model::sizes(),
-        "effort" => Effort::sizes(),
-        "spinner" => Spinner::sizes(),
-        _ => return None,
-    })
+    Some((entry(name)?.sizes)())
 }
 
 pub fn default_size_for(name: &str) -> Option<Size> {
-    Some(match name {
-        "repo" => Repo::default_size(),
-        "branch" => Branch::default_size(),
-        "pr_icon" => PrIcon::default_size(),
-        "pr_num" => PrNum::default_size(),
-        "ci" => Ci::default_size(),
-        "review" => Review::default_size(),
-        "comments" => Comments::default_size(),
-        "dirty" => Dirty::default_size(),
-        "ahead" => Ahead::default_size(),
-        "behind" => Behind::default_size(),
-        "ticket" => Ticket::default_size(),
-        "chips" => Chips::default_size(),
-        "burn" => Burn::default_size(),
-        "agents" => Agents::default_size(),
-        "quotas" => Quotas::default_size(),
-        n if quotas_bucket_kind(n).is_some() => Quotas::default_size(),
-        "ctx_bar" => CtxBar::default_size(),
-        "loc" => Loc::default_size(),
-        "model" => Model::default_size(),
-        "effort" => Effort::default_size(),
-        "spinner" => Spinner::default_size(),
-        _ => return None,
-    })
+    Some((entry(name)?.default_size)())
 }
 
-/// Default priority assignments. Higher = shrunk later. Keep important visual
-/// cues (model, ctx_bar, spinner, branch) high; nice-to-haves (chips, burn,
-/// agents) low. Required-to-show items can also set `required = true`.
+/// Default priority. The `quotas.<bucket>` pseudo-components sit above the
+/// combined `quotas` row so an individual bucket survives longer than the
+/// block it came from.
 pub fn default_priority(name: &str) -> u32 {
     match name {
-        "spinner" => 100,
-        "ctx_bar" => 90,
-        "model" => 80,
-        "branch" => 75,
-        "pr_icon" => 70,
-        "pr_num" => 65,
-        "loc" => 60,
-        "effort" => 55,
-        "ci" => 50,
-        "review" => 45,
-        "ticket" => 40,
-        "dirty" => 35,
-        "ahead" | "behind" => 30,
-        "comments" => 25,
-        "repo" => 20,
-        "quotas" => 15,
         "quotas.hourly" => 25,
         "quotas.weekly" => 20,
         "quotas.design" => 18,
         "quotas.sonnet" => 17,
-        "agents" => 10,
-        "burn" => 8,
-        "chips" => 5,
-        _ => 5,
+        _ => entry(name).map(|e| e.priority).unwrap_or(5),
     }
+}
+
+/// The `[name]` common config block, or a default when the component is
+/// unknown or the user wrote no block for it.
+pub fn common_config(cfg: &crate::config::Config, name: &str) -> ComponentConfig {
+    entry(name).map(|e| (e.common)(cfg)).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1735,7 +1846,7 @@ mod tests {
         let cfg = QuotasConfig {
             weekly: Some(BucketConfig {
                 common: crate::component::ComponentConfig {
-                    priority: 99,
+                    priority: Some(99),
                     ..crate::component::ComponentConfig::default()
                 },
                 ..BucketConfig::default()
@@ -1748,7 +1859,7 @@ mod tests {
             .as_ref()
             .map(|b| b.common.clone())
             .unwrap_or_default();
-        assert_eq!(bucket_common.priority, 99);
+        assert_eq!(bucket_common.priority, Some(99));
     }
 
     #[test]
@@ -2033,6 +2144,7 @@ mod tests {
             state: "MERGED".into(),
             is_draft: false,
             merged_at: ts,
+            auto_merge: false,
         }
     }
 
@@ -2041,6 +2153,7 @@ mod tests {
             state: state.into(),
             is_draft: false,
             merged_at: None,
+            auto_merge: false,
         }
     }
 
@@ -2116,11 +2229,57 @@ mod tests {
     }
 
     #[test]
-    fn chips_keeps_old_closed_pr() {
+    fn chips_keeps_old_closed_pr_when_summary_disabled() {
         let other = other_with_states(vec![101, 102], vec![(102, lite_state("CLOSED"))]);
+        let cfg = ChipsConfig {
+            closed_summary: false,
+            ..ChipsConfig::default()
+        };
+        let txt = render_chips(&other, &cfg, "https://github.com/foo/bar/pull/999");
+        assert!(txt.contains("#102"), "closed kept inline: {txt}");
+    }
+
+    #[test]
+    fn chips_collapses_closed_into_summary_chip() {
+        // 3 CLOSED + 1 OPEN. Default closed_summary=true → CLOSED×3 chip
+        // appears, individual #143/#144/#176 chips do not.
+        let other = other_with_states(
+            vec![143, 144, 147, 176],
+            vec![
+                (143, lite_state("CLOSED")),
+                (144, lite_state("CLOSED")),
+                (147, lite_state("OPEN")),
+                (176, lite_state("CLOSED")),
+            ],
+        );
         let cfg = ChipsConfig::default();
         let txt = render_chips(&other, &cfg, "https://github.com/foo/bar/pull/999");
-        assert!(txt.contains("#102"), "closed not affected: {txt}");
+        assert!(
+            txt.contains(&format!("{PR_CLOSED}×3")),
+            "CLOSED×3 summary chip expected: {txt}"
+        );
+        assert!(!txt.contains("#143"), "individual closed dropped: {txt}");
+        assert!(!txt.contains("#144"), "individual closed dropped: {txt}");
+        assert!(!txt.contains("#176"), "individual closed dropped: {txt}");
+        assert!(txt.contains("#147"), "open kept inline: {txt}");
+    }
+
+    #[test]
+    fn chips_closed_summary_keeps_current_pr_inline() {
+        // Current PR is CLOSED — must still render inline, never folded into
+        // the CLOSED×N summary.
+        let other = other_with_states(
+            vec![143, 144],
+            vec![(143, lite_state("CLOSED")), (144, lite_state("CLOSED"))],
+        );
+        let cfg = ChipsConfig::default();
+        let txt = render_chips(&other, &cfg, &url(143));
+        assert!(txt.contains("#143"), "current closed PR kept inline: {txt}");
+        assert!(!txt.contains("#144"), "non-current closed folded: {txt}");
+        assert!(
+            txt.contains(&format!("{PR_CLOSED}×1")),
+            "CLOSED×1 summary expected: {txt}"
+        );
     }
 
     #[test]
@@ -2135,6 +2294,83 @@ mod tests {
             txt.contains("#102"),
             "current branch PR never filtered: {txt}"
         );
+    }
+
+    #[test]
+    fn chips_caps_recent_merged_by_count() {
+        let now = crate::cache::now_epoch();
+        // 5 merged PRs all within the age window, ascending merged_at: 201
+        // (oldest) → 205 (newest). Cap at 3 → drop 201, 202.
+        let other = other_with_states(
+            vec![201, 202, 203, 204, 205],
+            vec![
+                (201, lite_merged(Some(now - 10 * 3600))),
+                (202, lite_merged(Some(now - 8 * 3600))),
+                (203, lite_merged(Some(now - 6 * 3600))),
+                (204, lite_merged(Some(now - 4 * 3600))),
+                (205, lite_merged(Some(now - 2 * 3600))),
+            ],
+        );
+        let cfg = ChipsConfig {
+            max_merged_chips: 3,
+            ..ChipsConfig::default()
+        };
+        let txt = render_chips(&other, &cfg, "https://github.com/foo/bar/pull/999");
+        assert!(!txt.contains("#201"), "oldest dropped: {txt}");
+        assert!(!txt.contains("#202"), "second-oldest dropped: {txt}");
+        assert!(txt.contains("#203"), "kept: {txt}");
+        assert!(txt.contains("#204"), "kept: {txt}");
+        assert!(txt.contains("#205"), "kept: {txt}");
+        assert!(
+            txt.contains(&format!("{MERGED}×2")),
+            "summary chip ×2 expected: {txt}"
+        );
+    }
+
+    #[test]
+    fn chips_cap_zero_disables_count_cap() {
+        let now = crate::cache::now_epoch();
+        let other = other_with_states(
+            vec![201, 202, 203, 204, 205],
+            vec![
+                (201, lite_merged(Some(now - 10 * 3600))),
+                (202, lite_merged(Some(now - 8 * 3600))),
+                (203, lite_merged(Some(now - 6 * 3600))),
+                (204, lite_merged(Some(now - 4 * 3600))),
+                (205, lite_merged(Some(now - 2 * 3600))),
+            ],
+        );
+        let cfg = ChipsConfig {
+            max_merged_chips: 0,
+            ..ChipsConfig::default()
+        };
+        let txt = render_chips(&other, &cfg, "https://github.com/foo/bar/pull/999");
+        for n in [201, 202, 203, 204, 205] {
+            assert!(txt.contains(&format!("#{n}")), "no cap → all kept: {txt}");
+        }
+    }
+
+    #[test]
+    fn chips_cap_never_drops_current_pr() {
+        let now = crate::cache::now_epoch();
+        // Current PR (#201) is the oldest merged; cap=1 should still keep it
+        // and drop the other older one (#202), keeping the newest non-current.
+        let other = other_with_states(
+            vec![201, 202, 203],
+            vec![
+                (201, lite_merged(Some(now - 10 * 3600))),
+                (202, lite_merged(Some(now - 8 * 3600))),
+                (203, lite_merged(Some(now - 2 * 3600))),
+            ],
+        );
+        let cfg = ChipsConfig {
+            max_merged_chips: 1,
+            ..ChipsConfig::default()
+        };
+        let txt = render_chips(&other, &cfg, &url(201));
+        assert!(txt.contains("#201"), "current PR never dropped: {txt}");
+        assert!(!txt.contains("#202"), "extra merged dropped: {txt}");
+        assert!(txt.contains("#203"), "newest non-current kept: {txt}");
     }
 
     #[test]
@@ -2265,5 +2501,70 @@ mod tests {
         let txt = render_chips(&other, &cfg, "https://github.com/foo/bar/pull/999");
         assert!(txt.contains("#101"), "stack bypass: {txt}");
         assert!(txt.contains("#102"), "stack bypass: {txt}");
+    }
+
+    /// The registry is the single source of truth: every row must answer all
+    /// five questions the layout engine asks. A half-registered component used
+    /// to be possible — five parallel match tables, miss one, get a silent
+    /// default.
+    #[test]
+    fn registry_rows_are_complete_and_consistent() {
+        let names: Vec<&str> = all_names().collect();
+        assert!(!names.is_empty(), "registry must not be empty");
+
+        // Names unique.
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(before, sorted.len(), "duplicate component name in registry");
+
+        for name in &names {
+            let sizes = sizes_for(name).unwrap_or_else(|| panic!("{name} has no sizes"));
+            assert!(!sizes.is_empty(), "{name} declares an empty size list");
+
+            let d = default_size_for(name).unwrap_or_else(|| panic!("{name} has no default size"));
+            assert!(
+                sizes.contains(&d),
+                "{name} default size {d:?} is not in its own size list {sizes:?}"
+            );
+
+            // Every row resolves a priority and a config block without panicking.
+            let _ = default_priority(name);
+            let _ = common_config(&crate::config::Config::default(), name);
+        }
+
+        // The layout defaults may only name registered components.
+        for n in crate::config::default_left()
+            .into_iter()
+            .chain(crate::config::default_right())
+        {
+            assert!(
+                sizes_for(&n).is_some(),
+                "default layout names unregistered component {n:?}"
+            );
+        }
+    }
+
+    /// `quotas.<bucket>` pseudo-components borrow the quotas row for shape but
+    /// keep their own priority, which must outrank the combined block.
+    #[test]
+    fn quotas_buckets_resolve_through_the_registry() {
+        for b in [
+            "quotas.hourly",
+            "quotas.weekly",
+            "quotas.design",
+            "quotas.sonnet",
+        ] {
+            assert_eq!(
+                sizes_for(b),
+                sizes_for("quotas"),
+                "{b} must share the quotas size list"
+            );
+            assert!(
+                default_priority(b) > default_priority("quotas"),
+                "{b} should outlive the combined quotas block"
+            );
+        }
     }
 }

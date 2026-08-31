@@ -19,7 +19,8 @@ pr_cache_ttl = 10
 other_cache_ttl = 120
 
 # Append focus diagnostics to /tmp/cc-focus-<session_id>.log every render.
-debug_focus_log = true
+# Off by default — the file is never rotated and grows ~1 line/second.
+debug_focus_log = false
 
 # Trailing spinner style.
 #   "compact"  – single braille frame, advanced one frame per render

@@ -4,7 +4,6 @@
 // this lib mirrors the same module set so both compile from the same sources.
 
 #![allow(
-    dead_code,
     clippy::collapsible_if,
     clippy::collapsible_match,
     clippy::unnecessary_cast,
@@ -17,6 +16,7 @@ pub mod components;
 pub mod config;
 pub mod focus;
 pub mod git;
+pub mod github;
 pub mod glyphs;
 pub mod input;
 pub mod layout;

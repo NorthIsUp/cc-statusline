@@ -65,6 +65,37 @@ pub fn maybe_spawn_stack(session_id: &str, cwd: &str, st: &state::State) {
     spawn_self(&["--refresh-stack", session_id], &[(ENV_STACK_CWD, cwd)]);
 }
 
+/// `(owner, name, branch)` for the repo at `cwd` — the inputs `gh pr view`
+/// derived implicitly from the origin remote and the checked-out branch.
+/// `None` on a detached HEAD, a missing/non-GitHub origin, or no repo.
+fn repo_identity(cwd: &str) -> Option<(String, String, String)> {
+    let repo = git2::Repository::discover(cwd).ok()?;
+    let head = repo.head().ok()?;
+    if !head.is_branch() {
+        return None;
+    }
+    let branch = head.shorthand().ok()?.to_string();
+    let remote = repo.find_remote("origin").ok()?;
+    let (owner, name) = parse_remote(remote.url().ok()?)?;
+    Some((owner, name, branch))
+}
+
+/// Extract `(owner, name)` from a github.com remote URL in any of the common
+/// forms (scp-style, https, ssh). Non-github.com hosts return `None`.
+fn parse_remote(url: &str) -> Option<(String, String)> {
+    let rest = url
+        .strip_prefix("git@github.com:")
+        .or_else(|| url.strip_prefix("https://github.com/"))
+        .or_else(|| url.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| url.strip_prefix("git://github.com/"))?;
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let (owner, name) = rest.split_once('/')?;
+    if owner.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some((owner.to_string(), name.to_string()))
+}
+
 fn spawn_self(args: &[&str], envs: &[(&str, &str)]) {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -83,95 +114,116 @@ fn spawn_self(args: &[&str], envs: &[(&str, &str)]) {
 
 pub fn run_refresh_pr(session_id: &str) {
     let cwd = std::env::var(ENV_CWD).unwrap_or_default();
+    {
+        let mut handle = match StateLock::acquire_blocking(session_id) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+
+        // Re-check freshness inside the lock — another worker may have already
+        // refreshed between our spawn and our acquire.
+        let ttl = config::config().pr_cache_ttl();
+        if state::fresh(handle.state.pr.fetched_at, ttl) && !handle.state.pr.json.is_empty() {
+            return;
+        }
+
+        // Mark the in-flight lock so concurrent foregrounds know not to
+        // re-spawn, then release before the fetch: a foreground render
+        // blocks on this same lock, so holding it across a network
+        // round-trip stalls the statusline for the length of the request.
+        handle.state.pr.locked_at = now_epoch();
+        let _ = handle.save();
+    }
+
+    // The PR for the current branch, fetched directly from GitHub's GraphQL
+    // API (was `gh pr view --json …`). `repo_identity` recovers the
+    // owner/name/branch that gh inferred implicitly from cwd; auth is the
+    // `GH_TOKEN`/`GITHUB_TOKEN` env var (see `github::token`).
+    //
+    // Two outcomes are "success" and one is "failure", and they must not be
+    // conflated:
+    //   - no repo / detached HEAD / non-GitHub origin → no PR context exists,
+    //     so cache an empty `"{}"` as fresh (the chip correctly shows nothing).
+    //   - `Some(json)` → a real PR (or a definitive "branch has no PR" `"{}"`);
+    //     cache it as fresh.
+    //   - `None` → the fetch itself failed (rate limit, network, missing
+    //     token). DON'T overwrite the last-known-good json and DON'T advance
+    //     `fetched_at` — otherwise a transient failure blanks the chip and
+    //     freezes that blank as "fresh" for a whole TTL, so it never recovers.
+    //     Instead keep the previous state and stamp `locked_at` as a short
+    //     retry backoff (`ttl.max(10)`s) so the next render re-attempts soon
+    //     without hammering the API every tick.
+    let fetched = match repo_identity(&cwd) {
+        Some((owner, name, branch)) => crate::github::pr_view_json(&owner, &name, &branch),
+        None => Some("{}".into()), // no PR context → definitive empty
+    };
+
+    // Re-acquire to commit the result. The state is re-read from disk here, so
+    // anything another worker wrote during the fetch is preserved.
     let mut handle = match StateLock::acquire_blocking(session_id) {
         Ok(h) => h,
         Err(_) => return,
     };
 
-    // Re-check freshness inside the lock — another worker may have already
-    // refreshed between our spawn and our acquire.
-    let ttl = config::config().pr_cache_ttl();
-    if state::fresh(handle.state.pr.fetched_at, ttl) && !handle.state.pr.json.is_empty() {
-        return;
-    }
-
-    // Mark the in-flight lock so concurrent foregrounds know not to re-spawn.
-    handle.state.pr.locked_at = now_epoch();
-    let _ = handle.save();
-
-    let body = match Command::new("gh")
-        .args([
-            "pr",
-            "view",
-            "--json",
-            "state,isDraft,reviewDecision,comments,statusCheckRollup,url,number",
-        ])
-        .current_dir(&cwd)
-        // Force gh's keychain credential, not whatever stale GITHUB_TOKEN
-        // might be in the environment. The user's shell often exports a
-        // narrow-scope token from another tool; unset it so gh uses the
-        // properly-authed keychain identity.
-        .env_remove("GITHUB_TOKEN")
-        .env_remove("GH_TOKEN")
-        .stderr(Stdio::null())
-        .output()
-    {
-        Ok(o) if o.status.success() && !o.stdout.is_empty() => {
-            String::from_utf8(o.stdout).unwrap_or_default()
+    match fetched {
+        Some(body) => {
+            handle.state.pr.json = body;
+            handle.state.pr.fetched_at = now_epoch();
+            handle.state.pr.locked_at = 0;
         }
-        _ => "{}".into(),
-    };
-
-    handle.state.pr.json = body;
-    handle.state.pr.fetched_at = now_epoch();
-    handle.state.pr.locked_at = 0;
+        None => {
+            // Preserve last-known-good json; leave fetched_at stale so we retry.
+            handle.state.pr.locked_at = now_epoch();
+        }
+    }
     let _ = handle.save();
 }
 
 pub fn run_refresh_other(session_id: &str) {
     let transcript = std::env::var(ENV_TRANSCRIPT).unwrap_or_default();
+    {
+        // Stamp the debounce, then release before the scan — the transcript
+        // runs to tens of MB and a foreground render waits on this lock.
+        let mut handle = match StateLock::acquire_blocking(session_id) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        handle.state.other_prs.locked_at = now_epoch();
+        let _ = handle.save();
+    }
+
+    // All PR URLs referenced in the transcript (created + linked), scanned
+    // in-process — the equivalent of `cc-thread-prs --urls-only --all`. This
+    // captures PRs created out-of-band (e.g. via Graphite `gt`) and ones the
+    // conversation merely touched. The chips component collapses a large set
+    // to a `×N` summary.
+    let new_urls = crate::transcript::pr_urls_in_transcript(&transcript);
+
     let mut handle = match StateLock::acquire_blocking(session_id) {
         Ok(h) => h,
         Err(_) => return,
     };
 
-    let helper = format!(
-        "{}/my/bin/cc-thread-prs",
-        std::env::var("HOME").unwrap_or_default()
-    );
-    if !std::path::Path::new(&helper).exists() {
-        return;
-    }
-    handle.state.other_prs.locked_at = now_epoch();
-    let _ = handle.save();
+    // Detect newly-created PRs in this session and force-refresh the global
+    // recent_prs cache so the chip lights up with state color immediately,
+    // instead of waiting up to `recent_prs_ttl` seconds.
+    let prev: std::collections::HashSet<String> =
+        handle.state.other_prs.urls.iter().cloned().collect();
+    let has_new = new_urls.iter().any(|u| !prev.contains(u));
 
-    // PRs *created* by this session only. Cross-repo bleed is impossible at
-    // this layer because cc-thread-prs only emits a URL when a tool_use in
-    // the transcript actually created a PR.
-    if let Ok(out) = Command::new(&helper)
-        .args(["--urls-only", "--transcript", &transcript])
-        .stderr(Stdio::null())
-        .output()
-    {
-        let new_urls: Vec<String> = String::from_utf8(out.stdout)
-            .unwrap_or_default()
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(|l| l.to_string())
-            .collect();
-
-        // Detect newly-created PRs in this session and force-refresh the
-        // global recent_prs cache so the chip lights up with state color
-        // immediately, instead of waiting up to `recent_prs_ttl` seconds.
-        let prev: std::collections::HashSet<&String> = handle.state.other_prs.urls.iter().collect();
-        let has_new = new_urls.iter().any(|u| !prev.contains(u));
-
-        handle.state.other_prs.urls = new_urls;
-        handle.state.other_prs.fetched_at = now_epoch();
-
-        if has_new {
-            invalidate_recent_prs();
+    // Union: keep all previously-seen URLs (so /compact rewriting the
+    // transcript doesn't drop chip history) and append any new ones in
+    // discovery order. Chips never age out — the chips component collapses
+    // to a `×N` summary when there are too many to render.
+    for u in new_urls {
+        if !prev.contains(&u) {
+            handle.state.other_prs.urls.push(u);
         }
+    }
+    handle.state.other_prs.fetched_at = now_epoch();
+
+    if has_new {
+        invalidate_recent_prs();
     }
 
     // States are now hydrated from the global recent_prs cache, which is
@@ -191,18 +243,27 @@ pub fn run_refresh_stack(session_id: &str) {
     if cwd.is_empty() {
         return;
     }
+    {
+        // Stamp the debounce, then release before shelling out to `gt` — a
+        // foreground render waits on this same lock.
+        let mut handle = match StateLock::acquire_blocking(session_id) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let ttl = config::config().stack_refresh_ttl();
+        if state::fresh(handle.state.stack.fetched_at, ttl) {
+            return;
+        }
+        handle.state.stack.locked_at = now_epoch();
+        let _ = handle.save();
+    }
+
+    let (is_gt, entries) = fetch_stack(&cwd);
+
     let mut handle = match StateLock::acquire_blocking(session_id) {
         Ok(h) => h,
         Err(_) => return,
     };
-    let ttl = config::config().stack_refresh_ttl();
-    if state::fresh(handle.state.stack.fetched_at, ttl) {
-        return;
-    }
-    handle.state.stack.locked_at = now_epoch();
-    let _ = handle.save();
-
-    let (is_gt, entries) = fetch_stack(&cwd);
     handle.state.stack.is_gt = is_gt;
     handle.state.stack.entries = entries;
     handle.state.stack.fetched_at = now_epoch();
@@ -298,68 +359,6 @@ fn depth_of(start: &str, parent: &std::collections::HashMap<String, Option<Strin
     d
 }
 
-/// Fetch states for many PRs in one GraphQL call instead of N `gh pr view`s.
-/// Each PR view is a single GraphQL query; batching them into aliased fields
-/// of one query brings N requests → 1, which is the difference between
-/// surviving and exhausting the 5000/hr GitHub API budget when many sessions
-/// each track several chips.
-fn fetch_other_states(urls: &[String]) -> String {
-    if urls.is_empty() {
-        return "{}".into();
-    }
-    // Build aliased query: pr0: repository(owner:"o", name:"r") { pullRequest(number: N) {...} }
-    let mut query = String::from("query {");
-    let mut url_by_alias: Vec<(String, String)> = Vec::new();
-    for (i, u) in urls.iter().enumerate() {
-        let (owner, name, num) = match parse_pr_url(u) {
-            Some(t) => t,
-            None => continue,
-        };
-        let alias = format!("pr{i}");
-        query.push_str(&format!(
-            r#"{alias}: repository(owner: "{owner}", name: "{name}") {{ pullRequest(number: {num}) {{ url state isDraft }} }} "#
-        ));
-        url_by_alias.push((alias, u.clone()));
-    }
-    query.push('}');
-
-    let out = Command::new("gh")
-        .args(["api", "graphql", "-f", &format!("query={query}")])
-        .env_remove("GITHUB_TOKEN")
-        .env_remove("GH_TOKEN")
-        .stderr(Stdio::null())
-        .output();
-    let body = match out {
-        Ok(o) if o.status.success() && !o.stdout.is_empty() => o.stdout,
-        _ => return "{}".into(),
-    };
-    let v: serde_json::Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(_) => return "{}".into(),
-    };
-    let data = match v.get("data") {
-        Some(d) => d,
-        None => return "{}".into(),
-    };
-
-    let mut acc = serde_json::Map::new();
-    for (alias, url) in url_by_alias {
-        let pr = match data.get(&alias).and_then(|r| r.get("pullRequest")) {
-            Some(p) if !p.is_null() => p,
-            _ => continue,
-        };
-        let mut entry = serde_json::Map::new();
-        if let Some(s) = pr.get("state") {
-            entry.insert("state".into(), s.clone());
-        }
-        if let Some(d) = pr.get("isDraft") {
-            entry.insert("isDraft".into(), d.clone());
-        }
-        acc.insert(url, serde_json::Value::Object(entry));
-    }
-    serde_json::to_string(&serde_json::Value::Object(acc)).unwrap_or_default()
-}
-
 /// Force the global recent-PRs cache to be considered stale on the next
 /// render, AND eagerly spawn a refresh worker now. Called when this session
 /// just created a PR, so the chip lights up with state color immediately.
@@ -369,12 +368,4 @@ fn invalidate_recent_prs() {
     cur.locked_at = 0;
     let _ = cur.save();
     crate::recent_prs::maybe_spawn_refresh();
-}
-
-fn parse_pr_url(u: &str) -> Option<(String, String, u64)> {
-    let rest = u.strip_prefix("https://github.com/")?;
-    let (repo, num_part) = rest.split_once("/pull/")?;
-    let (owner, name) = repo.split_once('/')?;
-    let num: u64 = num_part.split(['/', '?', '#']).next()?.parse().ok()?;
-    Some((owner.to_string(), name.to_string(), num))
 }

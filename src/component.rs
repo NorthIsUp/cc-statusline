@@ -99,31 +99,20 @@ pub struct RenderCtx<'a> {
 }
 
 /// Common per-component config. Lives at the top of every `[name]` block.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Clone, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct ComponentConfig {
     /// Sizes the user has whitelisted. Empty = use the component's full set.
     pub sizes: Vec<Size>,
     /// Don't shrink past this size. None = component's smallest.
     pub min: Option<Size>,
-    /// Higher = shrunk LAST when autoresizing. Default 5.
-    pub priority: u32,
+    /// Higher = shrunk LAST when autoresizing. Unset falls back to the
+    /// component's `components::default_priority`.
+    pub priority: Option<u32>,
     /// If true, never drop entirely.
     pub required: bool,
     /// Override of the default size. None = component's `default_size()`.
     pub default: Option<Size>,
-}
-
-impl Default for ComponentConfig {
-    fn default() -> Self {
-        Self {
-            sizes: Vec::new(),
-            min: None,
-            priority: 5,
-            required: false,
-            default: None,
-        }
-    }
 }
 
 /// The trait every renderable element implements.

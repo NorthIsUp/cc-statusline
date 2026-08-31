@@ -5,6 +5,24 @@ pub fn nf_width() -> u32 {
     // Default to 2: most modern Nerd Font Mono fonts in iTerm2/Alacritty
     // render PUA glyphs as 2 cells wide. Override to 1 via env or config if
     // your font renders them single-wide.
+    //
+    // Resolved once: `cell_width` calls this for every character of every
+    // candidate render, and the layout engine re-renders on each shrink step.
+    // A render is a one-shot process, so the value cannot change under us.
+    #[cfg(not(test))]
+    {
+        static W: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *W.get_or_init(resolve_nf_width)
+    }
+    // Tests set CC_STATUSLINE_NF_WIDTH per-case inside one process, so they
+    // need the live value rather than whichever case ran first.
+    #[cfg(test)]
+    {
+        resolve_nf_width()
+    }
+}
+
+fn resolve_nf_width() -> u32 {
     std::env::var("CC_STATUSLINE_NF_WIDTH")
         .ok()
         .and_then(|v| v.parse().ok())
