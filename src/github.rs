@@ -8,6 +8,7 @@
 //! chip rather than an error.
 
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -99,6 +100,62 @@ pub fn pr_view_json(owner: &str, name: &str, branch: &str) -> Option<String> {
     );
 
     parse_pr_view(&graphql(&query)?)
+}
+
+/// The current PR for each watched branch, keyed by `Watch::key()`.
+///
+/// One aliased query covers every branch, so N live sessions cost one request
+/// rather than N. Each alias is projected through the same `parse_pr_view` used
+/// by the single-branch path, so the cached blob shape is identical either way.
+///
+/// A branch whose alias came back null or unparseable is simply absent from the
+/// map — the caller keeps whatever it had rather than blanking a chip.
+pub fn branch_prs(watches: &[crate::state::Watch]) -> Option<HashMap<String, String>> {
+    if watches.is_empty() {
+        return Some(HashMap::new());
+    }
+    let mut query = String::from("query {\n");
+    let mut keyed: Vec<(String, String)> = Vec::new();
+    for (i, w) in watches.iter().enumerate() {
+        let alias = format!("b{i}");
+        query.push_str(&format!(
+            r#"  {alias}: repository(owner: "{o}", name: "{n}") {{
+    pullRequests(headRefName: "{b}", first: 1, orderBy: {{field: CREATED_AT, direction: DESC}}) {{
+      nodes {{
+        state isDraft reviewDecision url number mergedAt
+        comments {{ totalCount }}
+        autoMergeRequest {{ __typename }}
+        commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ contexts(first: 100) {{ nodes {{
+          __typename
+          ... on CheckRun {{ conclusion status }}
+        }} }} }} }} }} }}
+      }}
+    }}
+  }}
+"#,
+            o = esc(&w.owner),
+            n = esc(&w.repo),
+            b = esc(&w.branch),
+        ));
+        keyed.push((alias, w.key()));
+    }
+    query.push_str("}\n");
+
+    let v = graphql(&query)?;
+    let mut out = HashMap::new();
+    for (alias, key) in keyed {
+        // Re-shape each alias into the envelope parse_pr_view expects, so the
+        // "errors mean failure, empty nodes mean no PR" distinction is decided
+        // in exactly one place.
+        let Some(repo) = v.pointer(&format!("/data/{alias}")) else {
+            continue;
+        };
+        let envelope = serde_json::json!({ "data": { "repository": repo } });
+        if let Some(json) = parse_pr_view(&envelope) {
+            out.insert(key, json);
+        }
+    }
+    Some(out)
 }
 
 /// Project a raw GraphQL response envelope into the `gh pr view --json …`

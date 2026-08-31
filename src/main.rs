@@ -43,10 +43,6 @@ fn main() {
     }
     if args.len() >= 3 {
         match args[1].as_str() {
-            "--refresh-pr" => {
-                refresh::run_refresh_pr(&args[2]);
-                return;
-            }
             "--refresh-other" => {
                 refresh::run_refresh_other(&args[2]);
                 return;
@@ -157,7 +153,6 @@ fn render_once() {
 
     // Spawn async refreshes for stale caches BEFORE rendering, so by the next
     // tick the freshest data is in place.
-    refresh::maybe_spawn_pr(&session.session_id, &session.cwd, &handle.state);
     refresh::maybe_spawn_other(&session.session_id, &session.transcript, &handle.state);
     refresh::maybe_spawn_stack(&session.session_id, &session.cwd, &handle.state);
     recent_prs::maybe_spawn_refresh();
@@ -165,6 +160,7 @@ fn render_once() {
     handle.state.tick = handle.state.tick.wrapping_add(1);
     let _focused = focus::detect(&session, &mut handle.state);
     let git = git::view(&session, &handle.state);
+    handle.state.watch = git.watch.clone();
     let other = transcript::other_prs_view(&handle.state, &git.origin_url);
     let (burn, agents) = transcript::scan(&session, &mut handle.state);
 

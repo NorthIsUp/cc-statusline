@@ -49,6 +49,8 @@ pub struct GitData {
     pub behind: u32,
     pub pr: PrJson,
     pub origin_url: String,
+    /// Repo/branch this session is on, published for the global worker.
+    pub watch: crate::state::Watch,
     pub git_dir: Option<PathBuf>,
     pub common_dir: Option<PathBuf>,
     pub toplevel: Option<PathBuf>,
@@ -133,8 +135,31 @@ pub fn view(session: &Session, st: &State) -> GitData {
 
     g.dirty = dirty_count(&repo);
 
-    if !st.pr.json.is_empty() {
-        if let Ok(parsed) = serde_json::from_str::<PrJson>(&st.pr.json) {
+    // What this session wants watched. Published to the state file so the one
+    // global worker can batch every live session's branch into a single query.
+    g.watch = crate::state::Watch {
+        owner: String::new(),
+        repo: String::new(),
+        branch: g.branch.clone(),
+    };
+    if let Some((owner, name)) = parse_github_remote(&g.origin_url) {
+        g.watch.owner = owner;
+        g.watch.repo = name;
+    }
+
+    // Prefer the shared watchlist result; fall back to this session's own blob
+    // so an upgrade (or a not-yet-run worker) still renders the last chip.
+    let from_global = if g.watch.is_empty() {
+        None
+    } else {
+        crate::recent_prs::RecentPrs::load()
+            .branches
+            .get(&g.watch.key())
+            .cloned()
+    };
+    let blob = from_global.unwrap_or_else(|| st.pr.json.clone());
+    if !blob.is_empty() {
+        if let Ok(parsed) = serde_json::from_str::<PrJson>(&blob) {
             g.pr = parsed;
         }
     }
@@ -169,6 +194,22 @@ fn dirty_count(repo: &git2::Repository) -> u32 {
     repo.statuses(Some(&mut opts))
         .map(|s| s.len() as u32)
         .unwrap_or(0)
+}
+
+/// `(owner, name)` from a github.com remote URL in any of the common forms
+/// (scp-style, https, ssh). Non-github.com hosts return `None`.
+pub fn parse_github_remote(url: &str) -> Option<(String, String)> {
+    let rest = url
+        .strip_prefix("git@github.com:")
+        .or_else(|| url.strip_prefix("https://github.com/"))
+        .or_else(|| url.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| url.strip_prefix("git://github.com/"))?;
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let (owner, name) = rest.split_once('/')?;
+    if owner.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some((owner.to_string(), name.to_string()))
 }
 
 pub fn extract_ticket(branch: &str) -> Option<String> {

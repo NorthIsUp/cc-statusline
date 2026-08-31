@@ -564,6 +564,7 @@ mod tests {
             behind: 0,
             pr: PrJson::default(),
             origin_url: "git@github.com:foo/bar.git".into(),
+            watch: Default::default(),
             git_dir: None,
             common_dir: None,
             toplevel: None,

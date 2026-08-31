@@ -34,6 +34,12 @@ pub struct RecentPrs {
     /// Map url -> {state, isDraft}. Stored as serde_json::Value-ish so we
     /// don't need a fixed schema in TOML.
     pub prs: HashMap<String, PrEntry>,
+    /// Map `owner/repo@branch` -> the `gh pr view`-shaped JSON blob for that
+    /// branch's PR. Populated by the single global worker from every live
+    /// session's published `watch`, so N sessions on the same branch cost one
+    /// lookup instead of N.
+    #[serde(default)]
+    pub branches: HashMap<String, String>,
 }
 
 /// Adaptive refresh interval from the last-seen rate-limit headroom: the fewer
@@ -121,6 +127,64 @@ fn carry_terminal(prev: &HashMap<String, PrEntry>, fresh: &mut HashMap<String, P
     }
 }
 
+/// Every distinct `Watch` published by an *active* session.
+///
+/// This is the watchlist: sessions write where they are, one worker reads the
+/// union. Two sessions on the same branch collapse to one lookup — on a live
+/// machine 7 polling sessions covered only 3 distinct branches, so 4 of every 7
+/// requests were asking a question another process had just asked.
+///
+/// Idle sessions are skipped for the same reason `collect_missing_urls` skips
+/// them: nobody is looking at that statusline, so its PR need not be fetched.
+fn collect_watches() -> Vec<crate::state::Watch> {
+    let dir = config::cache_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut seen: std::collections::HashSet<crate::state::Watch> = std::collections::HashSet::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("toml") {
+            continue;
+        }
+        if path.file_name().and_then(|s| s.to_str()) == Some("recent_prs.toml") {
+            continue;
+        }
+        let Some(mtime) = crate::cache::mtime(&path) else {
+            continue;
+        };
+        if !matches!(classify_age(now_epoch() - mtime), SessionAge::Active) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(st) = toml::from_str::<crate::state::State>(&text) else {
+            continue;
+        };
+        if !st.watch.is_empty() {
+            seen.insert(st.watch);
+        }
+    }
+    seen.into_iter().collect()
+}
+
+/// Fetch the current PR for each watched branch, keyed by `Watch::key()`.
+///
+/// Chunked so one oversized batch cannot fail the lot; a branch whose lookup
+/// fails is simply absent from the result and its previous value is kept by
+/// the caller.
+fn fetch_branch_prs(watches: &[crate::state::Watch]) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for chunk in watches.chunks(20) {
+        if let Some(m) = crate::github::branch_prs(chunk) {
+            out.extend(m);
+        }
+    }
+    out
+}
+
 /// Spawn a detached refresh worker if the cache is stale and not currently
 /// locked. Returns immediately — the worker runs in background.
 pub fn maybe_spawn_refresh() {
@@ -190,10 +254,19 @@ pub fn run_refresh() {
                 prs.entry(url).or_insert(entry);
             }
         }
+        // The watchlist: one batched lookup covering every live session's
+        // branch, replacing one `--refresh-pr` process per session.
+        let watches = collect_watches();
+        let mut branches = cur.branches.clone();
+        if !watches.is_empty() {
+            branches.extend(fetch_branch_prs(&watches));
+        }
+
         let mut new = RecentPrs {
             version: crate::state::STATE_VERSION.into(),
             fetched_at: now_epoch(),
             locked_at: 0,
+            branches,
             // Carry the last-seen headroom forward (0 = unobserved → healthy),
             // so `adaptive_ttl` can space out the next round of refreshes.
             rate_remaining: remaining.unwrap_or(cur.rate_remaining),
