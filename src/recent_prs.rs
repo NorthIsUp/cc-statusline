@@ -94,21 +94,28 @@ fn fresh(at: i64, ttl: i64) -> bool {
     at > 0 && (now_epoch() - at) < ttl
 }
 
-/// Seed `fresh` with everything `prev` already knew to be MERGED.
-///
-/// A merged PR is terminal — GitHub offers no way to un-merge one — so a
-/// cached MERGED entry can never disagree with what a re-fetch would return.
+/// A PR merged at least this long ago is settled: never re-fetch it.
+const MERGED_SETTLED_AFTER: i64 = 7 * 86_400;
+
+/// Seed `fresh` with every entry in `prev` that has settled — merged, and
+/// merged long enough ago that nothing about it can still change.
 ///
 /// Without this, every PR outside the recent-100 `viewer` window was re-fetched
 /// *and then discarded* on each cycle: `fetch()` returns only that window, so
 /// the next cache was rebuilt from it and the previous cycle's lookups were
 /// thrown away. Measured on a live cache, 78 of 104 entries were MERGED —
-/// three quarters of the work re-asking a question whose answer cannot change.
+/// most of that work re-asking a question whose answer cannot change.
 ///
-/// CLOSED is deliberately not carried forward: a closed PR can be reopened.
-fn carry_terminal(prev: &HashMap<String, PrEntry>, fresh: &mut HashMap<String, PrEntry>) {
+/// Recently-merged PRs are deliberately *not* frozen: they still sit in the
+/// viewer window, so re-reading them is free, and their `merged_at` is what
+/// the chip-collapse rules key on. CLOSED is never carried — it can reopen.
+fn carry_terminal(prev: &HashMap<String, PrEntry>, fresh: &mut HashMap<String, PrEntry>, now: i64) {
     for (url, entry) in prev {
-        if entry.state == "MERGED" {
+        let settled = entry.state == "MERGED"
+            && entry
+                .merged_at
+                .is_some_and(|t| now - t >= MERGED_SETTLED_AFTER);
+        if settled {
             fresh.entry(url.clone()).or_insert_with(|| entry.clone());
         }
     }
@@ -171,7 +178,7 @@ pub fn run_refresh() {
     sweep_orphan_sidecars(&config::cache_dir());
 
     if let Some((mut prs, remaining)) = fetch() {
-        carry_terminal(&cur.prs, &mut prs);
+        carry_terminal(&cur.prs, &mut prs, now_epoch());
 
         // Second pass: hydrate any URLs referenced by other_prs.urls in any
         // session state file that aren't already present in the freshly
@@ -600,67 +607,81 @@ mod tests {
 mod carry_tests {
     use super::*;
 
-    fn entry(state: &str, number: u64) -> PrEntry {
+    const NOW: i64 = 1_800_000_000;
+
+    fn entry(state: &str, number: u64, merged_ago: Option<i64>) -> PrEntry {
         PrEntry {
             state: state.into(),
             is_draft: false,
             number,
-            merged_at: Some(1),
+            merged_at: merged_ago.map(|d| NOW - d),
             auto_merge: false,
         }
     }
 
-    /// A MERGED entry outside the fresh viewer window survives, so the next
-    /// `collect_missing_urls` no longer lists it and it is never re-fetched.
+    /// Merged over a week ago: settled, so it is carried forward and never
+    /// listed as missing again.
     #[test]
-    fn merged_is_carried_forward() {
+    fn settled_merge_is_carried_forward() {
         let mut prev = HashMap::new();
-        prev.insert(
-            "https://github.com/o/r/pull/1".to_string(),
-            entry("MERGED", 1),
-        );
+        prev.insert("u1".to_string(), entry("MERGED", 1, Some(8 * 86_400)));
         let mut fresh = HashMap::new();
 
-        carry_terminal(&prev, &mut fresh);
+        carry_terminal(&prev, &mut fresh, NOW);
 
-        assert_eq!(fresh.len(), 1, "merged entry must be carried");
-        assert_eq!(fresh["https://github.com/o/r/pull/1"].state, "MERGED");
+        assert_eq!(fresh.len(), 1, "settled merge must be carried");
     }
 
-    /// CLOSED and OPEN are not terminal — a closed PR can be reopened, an open
-    /// one obviously changes — so neither is carried and both get re-fetched.
+    /// Merged recently: still inside the viewer window, so re-reading is free
+    /// and we do not freeze it.
+    #[test]
+    fn recent_merge_is_not_frozen() {
+        let mut prev = HashMap::new();
+        prev.insert("u1".to_string(), entry("MERGED", 1, Some(2 * 86_400)));
+        let mut fresh = HashMap::new();
+
+        carry_terminal(&prev, &mut fresh, NOW);
+
+        assert!(fresh.is_empty(), "recent merge should not be frozen");
+    }
+
+    /// Undated merges are never frozen — we cannot show they have settled.
+    #[test]
+    fn undated_merge_is_not_frozen() {
+        let mut prev = HashMap::new();
+        prev.insert("u1".to_string(), entry("MERGED", 1, None));
+        let mut fresh = HashMap::new();
+
+        carry_terminal(&prev, &mut fresh, NOW);
+
+        assert!(fresh.is_empty(), "undated merge should not be frozen");
+    }
+
+    /// CLOSED and OPEN are never terminal — a closed PR can be reopened.
     #[test]
     fn non_terminal_states_are_not_carried() {
         let mut prev = HashMap::new();
-        prev.insert(
-            "https://github.com/o/r/pull/2".to_string(),
-            entry("CLOSED", 2),
-        );
-        prev.insert(
-            "https://github.com/o/r/pull/3".to_string(),
-            entry("OPEN", 3),
-        );
+        prev.insert("u2".to_string(), entry("CLOSED", 2, Some(8 * 86_400)));
+        prev.insert("u3".to_string(), entry("OPEN", 3, None));
         let mut fresh = HashMap::new();
 
-        carry_terminal(&prev, &mut fresh);
+        carry_terminal(&prev, &mut fresh, NOW);
 
-        assert!(fresh.is_empty(), "only MERGED is terminal, got {fresh:?}");
+        assert!(fresh.is_empty(), "only settled merges carry, got {fresh:?}");
     }
 
-    /// A fresh fetch always wins: if the viewer window already returned this
-    /// PR, the live value is kept rather than the cached one.
+    /// A fresh fetch always wins over the cached copy.
     #[test]
     fn fresh_result_takes_precedence_over_cache() {
-        let url = "https://github.com/o/r/pull/4".to_string();
         let mut prev = HashMap::new();
-        prev.insert(url.clone(), entry("MERGED", 4));
+        prev.insert("u4".to_string(), entry("MERGED", 4, Some(8 * 86_400)));
         let mut fresh = HashMap::new();
-        fresh.insert(url.clone(), entry("OPEN", 4));
+        fresh.insert("u4".to_string(), entry("OPEN", 4, None));
 
-        carry_terminal(&prev, &mut fresh);
+        carry_terminal(&prev, &mut fresh, NOW);
 
         assert_eq!(
-            fresh[&url].state, "OPEN",
+            fresh["u4"].state, "OPEN",
             "live value must not be clobbered"
         );
     }

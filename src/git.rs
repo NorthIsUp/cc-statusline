@@ -19,6 +19,9 @@ pub struct PrJson {
     pub status_check_rollup: Vec<CheckRow>,
     pub url: String,
     pub number: Option<u64>,
+    /// RFC3339 merge timestamp, or empty when the PR is not merged.
+    #[serde(rename = "mergedAt")]
+    pub merged_at: String,
     /// Non-null iff automerge is enabled on the PR. We only care about
     /// presence/absence, so any JSON value is accepted.
     #[serde(rename = "autoMergeRequest")]

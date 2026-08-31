@@ -82,7 +82,7 @@ pub fn pr_view_json(owner: &str, name: &str, branch: &str) -> Option<String> {
   repository(owner: "{o}", name: "{n}") {{
     pullRequests(headRefName: "{b}", first: 1, orderBy: {{field: CREATED_AT, direction: DESC}}) {{
       nodes {{
-        state isDraft reviewDecision url number
+        state isDraft reviewDecision url number mergedAt
         comments {{ totalCount }}
         autoMergeRequest {{ __typename }}
         commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ contexts(first: 100) {{ nodes {{
@@ -145,6 +145,7 @@ fn parse_pr_view(v: &Value) -> Option<String> {
         str_or_empty(node, "reviewDecision"),
     );
     pr.insert("url".into(), str_or_empty(node, "url"));
+    pr.insert("mergedAt".into(), str_or_empty(node, "mergedAt"));
     if let Some(num) = node.get("number").cloned() {
         pr.insert("number".into(), num);
     }
