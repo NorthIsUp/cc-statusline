@@ -46,7 +46,7 @@ nerd_font_width     = 2             # cell width of Nerd Font PUA glyphs
 pr_cache_ttl        = 60            # seconds, current-branch PR
 other_cache_ttl     = 600           # seconds, "other PRs" URL list
 recent_prs_ttl      = 20            # seconds, global gh api graphql cache
-debug_focus_log     = true
+debug_focus_log     = false         # unrotated ~1 line/s log; opt in to debug
 spinner             = "compact"     # or "epoch-N" (last N digits of epoch)
 ```
 

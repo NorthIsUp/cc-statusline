@@ -157,8 +157,11 @@ impl Config {
     pub fn recent_prs_ttl(&self) -> i64 {
         self.recent_prs_ttl.unwrap_or(20)
     }
+    /// Off by default: this appends a line per render (~1/s) to an
+    /// unrotated `/tmp/cc-focus-<session>.log`, and defaulting it on left
+    /// 38MB across 24 files on a normal machine. Opt in when debugging focus.
     pub fn debug_focus_log(&self) -> bool {
-        self.debug_focus_log.unwrap_or(true)
+        self.debug_focus_log.unwrap_or(false)
     }
     pub fn spinner(&self) -> String {
         self.spinner.clone().unwrap_or_else(|| "compact".into())
