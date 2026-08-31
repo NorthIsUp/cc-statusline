@@ -171,8 +171,7 @@ fn render_once() {
     let _focused = focus::detect(&session, &mut handle.state);
     let git = git::view(&session, &handle.state);
     let other = transcript::other_prs_view(&handle.state, &git.origin_url);
-    let burn = transcript::burn_rate(&session, &mut handle.state);
-    let agents = transcript::agent_counter(&session, &mut handle.state);
+    let (burn, agents) = transcript::scan(&session, &mut handle.state);
 
     let line = render::build_with_state(
         &session,
