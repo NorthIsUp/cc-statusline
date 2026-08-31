@@ -34,6 +34,12 @@ pub struct RecentPrs {
     /// Map url -> {state, isDraft}. Stored as serde_json::Value-ish so we
     /// don't need a fixed schema in TOML.
     pub prs: HashMap<String, PrEntry>,
+    /// Map `owner/repo@branch` -> the `gh pr view`-shaped JSON blob for that
+    /// branch's PR. Populated by the single global worker from every live
+    /// session's published `watch`, so N sessions on the same branch cost one
+    /// lookup instead of N.
+    #[serde(default)]
+    pub branches: HashMap<String, String>,
 }
 
 /// Adaptive refresh interval from the last-seen rate-limit headroom: the fewer
@@ -94,6 +100,91 @@ fn fresh(at: i64, ttl: i64) -> bool {
     at > 0 && (now_epoch() - at) < ttl
 }
 
+/// A PR merged at least this long ago is settled: never re-fetch it.
+const MERGED_SETTLED_AFTER: i64 = 7 * 86_400;
+
+/// Seed `fresh` with every entry in `prev` that has settled — merged, and
+/// merged long enough ago that nothing about it can still change.
+///
+/// Without this, every PR outside the recent-100 `viewer` window was re-fetched
+/// *and then discarded* on each cycle: `fetch()` returns only that window, so
+/// the next cache was rebuilt from it and the previous cycle's lookups were
+/// thrown away. Measured on a live cache, 78 of 104 entries were MERGED —
+/// most of that work re-asking a question whose answer cannot change.
+///
+/// Recently-merged PRs are deliberately *not* frozen: they still sit in the
+/// viewer window, so re-reading them is free, and their `merged_at` is what
+/// the chip-collapse rules key on. CLOSED is never carried — it can reopen.
+fn carry_terminal(prev: &HashMap<String, PrEntry>, fresh: &mut HashMap<String, PrEntry>, now: i64) {
+    for (url, entry) in prev {
+        let settled = entry.state == "MERGED"
+            && entry
+                .merged_at
+                .is_some_and(|t| now - t >= MERGED_SETTLED_AFTER);
+        if settled {
+            fresh.entry(url.clone()).or_insert_with(|| entry.clone());
+        }
+    }
+}
+
+/// Every distinct `Watch` published by an *active* session.
+///
+/// This is the watchlist: sessions write where they are, one worker reads the
+/// union. Two sessions on the same branch collapse to one lookup — on a live
+/// machine 7 polling sessions covered only 3 distinct branches, so 4 of every 7
+/// requests were asking a question another process had just asked.
+///
+/// Idle sessions are skipped for the same reason `collect_missing_urls` skips
+/// them: nobody is looking at that statusline, so its PR need not be fetched.
+fn collect_watches() -> Vec<crate::state::Watch> {
+    let dir = config::cache_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut seen: std::collections::HashSet<crate::state::Watch> = std::collections::HashSet::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("toml") {
+            continue;
+        }
+        if path.file_name().and_then(|s| s.to_str()) == Some("recent_prs.toml") {
+            continue;
+        }
+        let Some(mtime) = crate::cache::mtime(&path) else {
+            continue;
+        };
+        if !matches!(classify_age(now_epoch() - mtime), SessionAge::Active) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(st) = toml::from_str::<crate::state::State>(&text) else {
+            continue;
+        };
+        if !st.watch.is_empty() {
+            seen.insert(st.watch);
+        }
+    }
+    seen.into_iter().collect()
+}
+
+/// Fetch the current PR for each watched branch, keyed by `Watch::key()`.
+///
+/// Chunked so one oversized batch cannot fail the lot; a branch whose lookup
+/// fails is simply absent from the result and its previous value is kept by
+/// the caller.
+fn fetch_branch_prs(watches: &[crate::state::Watch]) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for chunk in watches.chunks(20) {
+        if let Some(m) = crate::github::branch_prs(chunk) {
+            out.extend(m);
+        }
+    }
+    out
+}
+
 /// Spawn a detached refresh worker if the cache is stale and not currently
 /// locked. Returns immediately — the worker runs in background.
 pub fn maybe_spawn_refresh() {
@@ -151,6 +242,8 @@ pub fn run_refresh() {
     sweep_orphan_sidecars(&config::cache_dir());
 
     if let Some((mut prs, remaining)) = fetch() {
+        carry_terminal(&cur.prs, &mut prs, now_epoch());
+
         // Second pass: hydrate any URLs referenced by other_prs.urls in any
         // session state file that aren't already present in the freshly
         // fetched viewer.pullRequests result. This catches PRs older than
@@ -161,10 +254,19 @@ pub fn run_refresh() {
                 prs.entry(url).or_insert(entry);
             }
         }
+        // The watchlist: one batched lookup covering every live session's
+        // branch, replacing one `--refresh-pr` process per session.
+        let watches = collect_watches();
+        let mut branches = cur.branches.clone();
+        if !watches.is_empty() {
+            branches.extend(fetch_branch_prs(&watches));
+        }
+
         let mut new = RecentPrs {
             version: crate::state::STATE_VERSION.into(),
             fetched_at: now_epoch(),
             locked_at: 0,
+            branches,
             // Carry the last-seen headroom forward (0 = unobserved → healthy),
             // so `adaptive_ttl` can space out the next round of refreshes.
             rate_remaining: remaining.unwrap_or(cur.rate_remaining),
@@ -571,5 +673,89 @@ mod tests {
         assert!(parse_pr_url("https://github.com/foo/bar/pull/").is_none());
         assert!(parse_pr_url("https://github.com/foo/bar/pull/abc").is_none());
         assert!(parse_pr_url("not a url").is_none());
+    }
+}
+
+#[cfg(test)]
+mod carry_tests {
+    use super::*;
+
+    const NOW: i64 = 1_800_000_000;
+
+    fn entry(state: &str, number: u64, merged_ago: Option<i64>) -> PrEntry {
+        PrEntry {
+            state: state.into(),
+            is_draft: false,
+            number,
+            merged_at: merged_ago.map(|d| NOW - d),
+            auto_merge: false,
+        }
+    }
+
+    /// Merged over a week ago: settled, so it is carried forward and never
+    /// listed as missing again.
+    #[test]
+    fn settled_merge_is_carried_forward() {
+        let mut prev = HashMap::new();
+        prev.insert("u1".to_string(), entry("MERGED", 1, Some(8 * 86_400)));
+        let mut fresh = HashMap::new();
+
+        carry_terminal(&prev, &mut fresh, NOW);
+
+        assert_eq!(fresh.len(), 1, "settled merge must be carried");
+    }
+
+    /// Merged recently: still inside the viewer window, so re-reading is free
+    /// and we do not freeze it.
+    #[test]
+    fn recent_merge_is_not_frozen() {
+        let mut prev = HashMap::new();
+        prev.insert("u1".to_string(), entry("MERGED", 1, Some(2 * 86_400)));
+        let mut fresh = HashMap::new();
+
+        carry_terminal(&prev, &mut fresh, NOW);
+
+        assert!(fresh.is_empty(), "recent merge should not be frozen");
+    }
+
+    /// Undated merges are never frozen — we cannot show they have settled.
+    #[test]
+    fn undated_merge_is_not_frozen() {
+        let mut prev = HashMap::new();
+        prev.insert("u1".to_string(), entry("MERGED", 1, None));
+        let mut fresh = HashMap::new();
+
+        carry_terminal(&prev, &mut fresh, NOW);
+
+        assert!(fresh.is_empty(), "undated merge should not be frozen");
+    }
+
+    /// CLOSED and OPEN are never terminal — a closed PR can be reopened.
+    #[test]
+    fn non_terminal_states_are_not_carried() {
+        let mut prev = HashMap::new();
+        prev.insert("u2".to_string(), entry("CLOSED", 2, Some(8 * 86_400)));
+        prev.insert("u3".to_string(), entry("OPEN", 3, None));
+        let mut fresh = HashMap::new();
+
+        carry_terminal(&prev, &mut fresh, NOW);
+
+        assert!(fresh.is_empty(), "only settled merges carry, got {fresh:?}");
+    }
+
+    /// A fresh fetch always wins over the cached copy.
+    #[test]
+    fn fresh_result_takes_precedence_over_cache() {
+        let mut prev = HashMap::new();
+        prev.insert("u4".to_string(), entry("MERGED", 4, Some(8 * 86_400)));
+        let mut fresh = HashMap::new();
+        fresh.insert("u4".to_string(), entry("OPEN", 4, None));
+
+        carry_terminal(&prev, &mut fresh, NOW);
+
+        assert_eq!(
+            fresh["u4"].state, "OPEN",
+            "live value must not be clobbered"
+        );
     }
 }

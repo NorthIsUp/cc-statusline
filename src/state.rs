@@ -40,6 +40,32 @@ pub struct State {
     /// Layout-engine hysteresis state — sticky shrink decisions across renders.
     #[serde(default)]
     pub layout: crate::layout::LayoutState,
+    /// What this session wants watched: the repo and branch it is sitting on.
+    /// Published so the single global refresh worker can fetch every live
+    /// session's PR in one batch instead of each session fetching its own.
+    #[serde(default)]
+    pub watch: Watch,
+}
+
+/// The repo/branch a session is on, published for the global refresh worker.
+/// Empty when the cwd is not a GitHub repo or HEAD is detached — those cost
+/// nothing, since there is no PR to look up.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Watch {
+    pub owner: String,
+    pub repo: String,
+    pub branch: String,
+}
+
+impl Watch {
+    pub fn is_empty(&self) -> bool {
+        self.owner.is_empty() || self.repo.is_empty() || self.branch.is_empty()
+    }
+    /// Stable cache key: `owner/repo@branch`.
+    pub fn key(&self) -> String {
+        format!("{}/{}@{}", self.owner, self.repo, self.branch)
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]

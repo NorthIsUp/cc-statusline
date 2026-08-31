@@ -15,8 +15,62 @@ const ENV_CWD: &str = "CC_STATUSLINE_REFRESH_CWD";
 const ENV_TRANSCRIPT: &str = "CC_STATUSLINE_REFRESH_TRANSCRIPT";
 const ENV_STACK_CWD: &str = "CC_STATUSLINE_STACK_CWD";
 
+/// A merged PR is re-checked at most once a day…
+const MERGED_PR_TTL: i64 = 86_400;
+
+/// …and once it has been merged this long, never again. Nothing about a PR
+/// merged a week ago can still change, and the branch it came from is long
+/// gone in practice.
+const MERGED_SETTLED_AFTER: i64 = 7 * 86_400;
+
+/// Never re-fetch. Not `i64::MAX`: `state::fresh` computes `now - at`, so an
+/// absurd TTL still has to survive that arithmetic.
+const TTL_NEVER: i64 = i64::MAX / 4;
+
+/// How long the cached current-branch PR stays fresh.
+///
+/// Re-asking a merged PR at `pr_cache_ttl` (60s by default) burns budget
+/// re-confirming a state that cannot change, so merged PRs get a day — and
+/// once merged for a week, they are settled and never re-fetched.
+///
+/// `merged_at` is the merge timestamp; `None`/unparseable falls back to the
+/// daily tier rather than freezing something we cannot date.
+fn pr_ttl(base: i64, state: &str, merged_at: Option<i64>, now: i64) -> i64 {
+    if state != "MERGED" {
+        return base;
+    }
+    match merged_at {
+        Some(t) if now - t >= MERGED_SETTLED_AFTER => TTL_NEVER,
+        _ => base.max(MERGED_PR_TTL),
+    }
+}
+
+/// `(state, merged_at)` from the cached PR JSON.
+fn cached_pr_status(json: &str) -> (String, Option<i64>) {
+    let v: serde_json::Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(_) => return (String::new(), None),
+    };
+    let state = v
+        .get("state")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    let merged_at = v
+        .get("mergedAt")
+        .and_then(|s| s.as_str())
+        .and_then(crate::input::ts_to_epoch);
+    (state, merged_at)
+}
+
 pub fn maybe_spawn_pr(session_id: &str, cwd: &str, st: &state::State) {
-    let ttl = config::config().pr_cache_ttl();
+    let (state_str, merged_at) = cached_pr_status(&st.pr.json);
+    let ttl = pr_ttl(
+        config::config().pr_cache_ttl(),
+        &state_str,
+        merged_at,
+        now_epoch(),
+    );
     if state::fresh(st.pr.fetched_at, ttl) && !st.pr.json.is_empty() {
         return;
     }
@@ -121,8 +175,16 @@ pub fn run_refresh_pr(session_id: &str) {
         };
 
         // Re-check freshness inside the lock — another worker may have already
-        // refreshed between our spawn and our acquire.
-        let ttl = config::config().pr_cache_ttl();
+        // refreshed between our spawn and our acquire. Uses the same tiered TTL
+        // as the spawn decision, so a settled merge is not re-fetched by a
+        // worker that some older binary queued.
+        let (state_str, merged_at) = cached_pr_status(&handle.state.pr.json);
+        let ttl = pr_ttl(
+            config::config().pr_cache_ttl(),
+            &state_str,
+            merged_at,
+            now_epoch(),
+        );
         if state::fresh(handle.state.pr.fetched_at, ttl) && !handle.state.pr.json.is_empty() {
             return;
         }
@@ -368,4 +430,81 @@ fn invalidate_recent_prs() {
     cur.locked_at = 0;
     let _ = cur.save();
     crate::recent_prs::maybe_spawn_refresh();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DAY: i64 = 86_400;
+    const NOW: i64 = 1_800_000_000;
+
+    /// An open PR keeps the short poll interval — its checks, review decision
+    /// and merge state all still move.
+    #[test]
+    fn open_pr_keeps_base_ttl() {
+        assert_eq!(pr_ttl(60, "OPEN", None, NOW), 60);
+        assert_eq!(pr_ttl(60, "CLOSED", None, NOW), 60);
+    }
+
+    /// Freshly merged: re-checked at most once a day, not every 60s.
+    #[test]
+    fn recently_merged_gets_daily_ttl() {
+        let merged = NOW - 2 * DAY;
+        assert_eq!(pr_ttl(60, "MERGED", Some(merged), NOW), DAY);
+    }
+
+    /// Merged for over a week: settled, never fetched again.
+    #[test]
+    fn long_merged_is_never_refetched() {
+        let merged = NOW - 8 * DAY;
+        assert_eq!(pr_ttl(60, "MERGED", Some(merged), NOW), TTL_NEVER);
+    }
+
+    /// Exactly at the boundary counts as settled.
+    #[test]
+    fn week_boundary_is_settled() {
+        assert_eq!(
+            pr_ttl(60, "MERGED", Some(NOW - MERGED_SETTLED_AFTER), NOW),
+            TTL_NEVER
+        );
+    }
+
+    /// A merge we cannot date falls back to the daily tier rather than being
+    /// frozen forever on a timestamp we never parsed.
+    #[test]
+    fn undated_merge_falls_back_to_daily() {
+        assert_eq!(pr_ttl(60, "MERGED", None, NOW), DAY);
+    }
+
+    /// `state::fresh` computes `now - at`, so TTL_NEVER must survive that
+    /// arithmetic rather than overflowing.
+    #[test]
+    fn ttl_never_does_not_overflow_freshness_check() {
+        assert!(NOW.checked_add(TTL_NEVER).is_some());
+        assert!(crate::state::fresh(NOW, TTL_NEVER));
+    }
+
+    /// Reading the cached blob: state and merge timestamp both come back, and
+    /// nothing malformed is mistaken for a merged PR.
+    #[test]
+    fn cached_status_parses_state_and_merged_at() {
+        let (st, at) = cached_pr_status(r#"{"state":"MERGED","mergedAt":"2026-08-31T00:00:00Z"}"#);
+        assert_eq!(st, "MERGED");
+        assert!(at.is_some(), "mergedAt should parse to an epoch");
+
+        for bad in ["{}", "", "not json", r#"{"state":null}"#] {
+            let (st, at) = cached_pr_status(bad);
+            assert_ne!(st, "MERGED", "{bad:?} must not read as merged");
+            assert!(at.is_none());
+        }
+    }
+
+    /// An empty cache must keep the short TTL, or a branch with no PR yet
+    /// would go unpolled for a day.
+    #[test]
+    fn empty_cache_keeps_base_ttl() {
+        let (st, at) = cached_pr_status("");
+        assert_eq!(pr_ttl(60, &st, at, NOW), 60);
+    }
 }
