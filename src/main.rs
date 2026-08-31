@@ -27,7 +27,9 @@
     clippy::manual_range_contains
 )]
 
-use cc_statusline::{components, focus, git, input, recent_prs, refresh, render, state, transcript};
+use cc_statusline::{
+    components, focus, git, input, recent_prs, refresh, render, state, transcript,
+};
 use std::io::{self, Read};
 
 fn main() {
@@ -105,7 +107,10 @@ fn preview_all() {
         .max()
         .unwrap_or(10);
 
-    println!("\x1b[1mcc-statusline component preview\x1b[0m  ({} components)", components::ALL_NAMES.len());
+    println!(
+        "\x1b[1mcc-statusline component preview\x1b[0m  ({} components)",
+        components::ALL_NAMES.len()
+    );
     println!();
     for &name in components::ALL_NAMES {
         let sizes = components::sizes_for(name).unwrap_or(&[]);

@@ -35,7 +35,11 @@ fn agent() -> &'static ureq::Agent {
         use ureq::config::Config;
         use ureq::tls::{TlsConfig, TlsProvider};
         Config::builder()
-            .tls_config(TlsConfig::builder().provider(TlsProvider::NativeTls).build())
+            .tls_config(
+                TlsConfig::builder()
+                    .provider(TlsProvider::NativeTls)
+                    .build(),
+            )
             .timeout_global(Some(HTTP_TIMEOUT))
             .build()
             .new_agent()
@@ -94,22 +98,52 @@ pub fn pr_view_json(owner: &str, name: &str, branch: &str) -> Option<String> {
         b = esc(branch),
     );
 
-    let v = graphql(&query)?;
+    parse_pr_view(&graphql(&query)?)
+}
+
+/// Project a raw GraphQL response envelope into the `gh pr view --json …`
+/// shape that `git::PrJson` deserialises. Split out from the network call so
+/// the error-vs-empty distinction is unit-testable.
+///
+/// Returns:
+///   - `None` — the response carries no usable `data` (a `{"data": null,
+///     "errors": […]}` rate-limit/transient envelope, or an unresolvable
+///     repo). Signals a *failed* fetch so the caller keeps last-known-good.
+///   - `Some("{}")` — a valid response whose `nodes` array is empty: the
+///     branch genuinely has no PR.
+///   - `Some(json)` — the projected PR object.
+fn parse_pr_view(v: &Value) -> Option<String> {
+    // GitHub signals rate limits and transient server errors as HTTP 200 with
+    // `{"data": null, "errors": [...]}`. Reading a missing `nodes` array as
+    // "no PR" there would wipe a real chip; distinguish a valid-but-empty
+    // response (branch genuinely has no PR → `Some("{}")`) from a failed one
+    // (null `data` / errors / unresolvable repo → `None`, so the caller keeps
+    // the last-known-good chip and retries).
+    // A missing `nodes` array (null `data` / errors envelope / unresolvable
+    // repo) propagates `None` → a *failed* fetch, distinct from the empty-array
+    // "no PR" case handled just below.
     let nodes = v
         .pointer("/data/repository/pullRequests/nodes")
-        .and_then(Value::as_array);
-    let node = match nodes.and_then(|n| n.first()) {
+        .and_then(Value::as_array)?;
+    let node = match nodes.first() {
         Some(n) => n,
-        None => return Some("{}".into()), // no PR for this branch
+        None => return Some("{}".into()), // valid response, no PR for this branch
     };
 
     let mut pr = Map::new();
     pr.insert("state".into(), str_or_empty(node, "state"));
     pr.insert(
         "isDraft".into(),
-        Value::Bool(node.get("isDraft").and_then(Value::as_bool).unwrap_or(false)),
+        Value::Bool(
+            node.get("isDraft")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
     );
-    pr.insert("reviewDecision".into(), str_or_empty(node, "reviewDecision"));
+    pr.insert(
+        "reviewDecision".into(),
+        str_or_empty(node, "reviewDecision"),
+    );
     pr.insert("url".into(), str_or_empty(node, "url"));
     if let Some(num) = node.get("number").cloned() {
         pr.insert("number".into(), num);
@@ -151,6 +185,7 @@ pub fn pr_view_json(owner: &str, name: &str, branch: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     /// Guards the hang: a stalled request used to block in `recvfrom` forever,
     /// orphaning the worker and starving the cache. 203.0.113.1 is TEST-NET-3 —
@@ -167,5 +202,81 @@ mod tests {
             elapsed < HTTP_TIMEOUT + Duration::from_secs(5),
             "took {elapsed:?} — global timeout did not fire"
         );
+    }
+
+    /// A rate-limit / transient error envelope (HTTP 200, null data) must read
+    /// as a *failure* (`None`), not as "branch has no PR" — otherwise the
+    /// caller caches a blank chip as fresh and freezes it. This is the bug.
+    #[test]
+    fn error_envelope_is_failure_not_empty() {
+        let v = json!({
+            "data": null,
+            "errors": [{ "type": "RATE_LIMITED", "message": "API rate limit exceeded" }],
+        });
+        assert_eq!(parse_pr_view(&v), None);
+    }
+
+    /// A valid response whose `nodes` array is empty means the branch genuinely
+    /// has no PR — a definitive empty result, distinct from a failure.
+    #[test]
+    fn empty_nodes_is_no_pr() {
+        let v = json!({
+            "data": { "repository": { "pullRequests": { "nodes": [] } } },
+        });
+        assert_eq!(parse_pr_view(&v).as_deref(), Some("{}"));
+    }
+
+    /// `repository: null` (repo not found / no access) has no `nodes` array, so
+    /// it is treated as a failure rather than silently blanking the chip.
+    #[test]
+    fn null_repository_is_failure() {
+        let v = json!({ "data": { "repository": null } });
+        assert_eq!(parse_pr_view(&v), None);
+    }
+
+    /// A real PR with automerge queued projects into a json blob whose
+    /// `autoMergeRequest` is non-null, so `PrJson::auto_merge()` reports true.
+    #[test]
+    fn automerge_pr_projects_non_null_automerge() {
+        let v = json!({
+            "data": { "repository": { "pullRequests": { "nodes": [{
+                "state": "OPEN",
+                "isDraft": false,
+                "reviewDecision": null,
+                "url": "https://github.com/o/r/pull/1672",
+                "number": 1672,
+                "comments": { "totalCount": 0 },
+                "autoMergeRequest": { "__typename": "AutoMergeRequest" },
+                "commits": { "nodes": [] }
+            }] } } },
+        });
+        let json = parse_pr_view(&v).expect("should project a PR");
+        let pr: crate::git::PrJson = serde_json::from_str(&json).unwrap();
+        assert_eq!(pr.state, "OPEN");
+        assert_eq!(pr.number, Some(1672));
+        assert!(
+            pr.auto_merge(),
+            "autoMergeRequest present → auto_merge() true"
+        );
+    }
+
+    /// An open PR without automerge projects a null `autoMergeRequest`, so
+    /// `auto_merge()` is false (the plain-open color path).
+    #[test]
+    fn open_pr_without_automerge_is_false() {
+        let v = json!({
+            "data": { "repository": { "pullRequests": { "nodes": [{
+                "state": "OPEN",
+                "isDraft": false,
+                "url": "https://github.com/o/r/pull/1",
+                "number": 1,
+                "comments": { "totalCount": 0 },
+                "autoMergeRequest": null,
+                "commits": { "nodes": [] }
+            }] } } },
+        });
+        let json = parse_pr_view(&v).expect("should project a PR");
+        let pr: crate::git::PrJson = serde_json::from_str(&json).unwrap();
+        assert!(!pr.auto_merge());
     }
 }
