@@ -94,6 +94,26 @@ fn fresh(at: i64, ttl: i64) -> bool {
     at > 0 && (now_epoch() - at) < ttl
 }
 
+/// Seed `fresh` with everything `prev` already knew to be MERGED.
+///
+/// A merged PR is terminal — GitHub offers no way to un-merge one — so a
+/// cached MERGED entry can never disagree with what a re-fetch would return.
+///
+/// Without this, every PR outside the recent-100 `viewer` window was re-fetched
+/// *and then discarded* on each cycle: `fetch()` returns only that window, so
+/// the next cache was rebuilt from it and the previous cycle's lookups were
+/// thrown away. Measured on a live cache, 78 of 104 entries were MERGED —
+/// three quarters of the work re-asking a question whose answer cannot change.
+///
+/// CLOSED is deliberately not carried forward: a closed PR can be reopened.
+fn carry_terminal(prev: &HashMap<String, PrEntry>, fresh: &mut HashMap<String, PrEntry>) {
+    for (url, entry) in prev {
+        if entry.state == "MERGED" {
+            fresh.entry(url.clone()).or_insert_with(|| entry.clone());
+        }
+    }
+}
+
 /// Spawn a detached refresh worker if the cache is stale and not currently
 /// locked. Returns immediately — the worker runs in background.
 pub fn maybe_spawn_refresh() {
@@ -151,6 +171,8 @@ pub fn run_refresh() {
     sweep_orphan_sidecars(&config::cache_dir());
 
     if let Some((mut prs, remaining)) = fetch() {
+        carry_terminal(&cur.prs, &mut prs);
+
         // Second pass: hydrate any URLs referenced by other_prs.urls in any
         // session state file that aren't already present in the freshly
         // fetched viewer.pullRequests result. This catches PRs older than
@@ -571,5 +593,75 @@ mod tests {
         assert!(parse_pr_url("https://github.com/foo/bar/pull/").is_none());
         assert!(parse_pr_url("https://github.com/foo/bar/pull/abc").is_none());
         assert!(parse_pr_url("not a url").is_none());
+    }
+}
+
+#[cfg(test)]
+mod carry_tests {
+    use super::*;
+
+    fn entry(state: &str, number: u64) -> PrEntry {
+        PrEntry {
+            state: state.into(),
+            is_draft: false,
+            number,
+            merged_at: Some(1),
+            auto_merge: false,
+        }
+    }
+
+    /// A MERGED entry outside the fresh viewer window survives, so the next
+    /// `collect_missing_urls` no longer lists it and it is never re-fetched.
+    #[test]
+    fn merged_is_carried_forward() {
+        let mut prev = HashMap::new();
+        prev.insert(
+            "https://github.com/o/r/pull/1".to_string(),
+            entry("MERGED", 1),
+        );
+        let mut fresh = HashMap::new();
+
+        carry_terminal(&prev, &mut fresh);
+
+        assert_eq!(fresh.len(), 1, "merged entry must be carried");
+        assert_eq!(fresh["https://github.com/o/r/pull/1"].state, "MERGED");
+    }
+
+    /// CLOSED and OPEN are not terminal — a closed PR can be reopened, an open
+    /// one obviously changes — so neither is carried and both get re-fetched.
+    #[test]
+    fn non_terminal_states_are_not_carried() {
+        let mut prev = HashMap::new();
+        prev.insert(
+            "https://github.com/o/r/pull/2".to_string(),
+            entry("CLOSED", 2),
+        );
+        prev.insert(
+            "https://github.com/o/r/pull/3".to_string(),
+            entry("OPEN", 3),
+        );
+        let mut fresh = HashMap::new();
+
+        carry_terminal(&prev, &mut fresh);
+
+        assert!(fresh.is_empty(), "only MERGED is terminal, got {fresh:?}");
+    }
+
+    /// A fresh fetch always wins: if the viewer window already returned this
+    /// PR, the live value is kept rather than the cached one.
+    #[test]
+    fn fresh_result_takes_precedence_over_cache() {
+        let url = "https://github.com/o/r/pull/4".to_string();
+        let mut prev = HashMap::new();
+        prev.insert(url.clone(), entry("MERGED", 4));
+        let mut fresh = HashMap::new();
+        fresh.insert(url.clone(), entry("OPEN", 4));
+
+        carry_terminal(&prev, &mut fresh);
+
+        assert_eq!(
+            fresh[&url].state, "OPEN",
+            "live value must not be clobbered"
+        );
     }
 }

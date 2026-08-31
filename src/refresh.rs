@@ -15,8 +15,33 @@ const ENV_CWD: &str = "CC_STATUSLINE_REFRESH_CWD";
 const ENV_TRANSCRIPT: &str = "CC_STATUSLINE_REFRESH_TRANSCRIPT";
 const ENV_STACK_CWD: &str = "CC_STATUSLINE_STACK_CWD";
 
+/// How long a MERGED current-branch PR stays fresh. A merged PR is terminal,
+/// so re-asking at `pr_cache_ttl` (60s by default) spends the bulk of this
+/// tool's GraphQL budget re-confirming a state that cannot change — measured
+/// at roughly 780 points/hr across 13 live sessions, against ~25/hr for the
+/// shared chip cache.
+///
+/// Not `never`: the same branch can get a new PR after the old one merges, so
+/// this is a long backstop rather than a permanent stop.
+const MERGED_PR_TTL: i64 = 1800;
+
+/// True when the cached PR JSON says MERGED.
+fn cached_pr_merged(json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| {
+            v.get("state")
+                .and_then(|s| s.as_str())
+                .map(|s| s == "MERGED")
+        })
+        .unwrap_or(false)
+}
+
 pub fn maybe_spawn_pr(session_id: &str, cwd: &str, st: &state::State) {
-    let ttl = config::config().pr_cache_ttl();
+    let mut ttl = config::config().pr_cache_ttl();
+    if cached_pr_merged(&st.pr.json) {
+        ttl = ttl.max(MERGED_PR_TTL);
+    }
     if state::fresh(st.pr.fetched_at, ttl) && !st.pr.json.is_empty() {
         return;
     }
@@ -368,4 +393,35 @@ fn invalidate_recent_prs() {
     cur.locked_at = 0;
     let _ = cur.save();
     crate::recent_prs::maybe_spawn_refresh();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A merged current-branch PR is terminal, so it must be recognised and
+    /// held far longer than `pr_cache_ttl`. Re-polling it every 60s across
+    /// every live session is where this tool's GraphQL budget actually went.
+    #[test]
+    fn merged_pr_json_is_detected() {
+        assert!(cached_pr_merged(r#"{"state":"MERGED","number":35}"#));
+    }
+
+    /// Every non-terminal state keeps the normal short TTL — an open PR's
+    /// checks, review decision and merge state all still move.
+    #[test]
+    fn non_merged_states_keep_short_ttl() {
+        assert!(!cached_pr_merged(r#"{"state":"OPEN"}"#));
+        assert!(!cached_pr_merged(r#"{"state":"CLOSED"}"#));
+    }
+
+    /// The empty-cache and malformed cases must not be mistaken for merged, or
+    /// a branch with no PR yet would stop being polled for half an hour.
+    #[test]
+    fn empty_or_malformed_json_is_not_merged() {
+        assert!(!cached_pr_merged("{}"));
+        assert!(!cached_pr_merged(""));
+        assert!(!cached_pr_merged("not json"));
+        assert!(!cached_pr_merged(r#"{"state":null}"#));
+    }
 }
