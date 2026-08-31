@@ -3,12 +3,20 @@
 //! statusline inherits the user's shell environment).
 //!
 //! Every call degrades to `None`/`"{}"` on any failure (missing token,
-//! network, HTTP error, malformed JSON) — callers fall back exactly as they
+//! network, HTTP error, timeout, malformed JSON) — callers fall back as they
 //! did when the `gh` subprocess failed, so an absent token just means no PR
 //! chip rather than an error.
 
 use serde_json::{Map, Value};
 use std::sync::OnceLock;
+use std::time::Duration;
+
+/// Hard ceiling on a whole request. Without it a stalled read blocks in
+/// `recvfrom` forever: the worker never fails, so it never stamps `locked_at`,
+/// so the backoff added in 18f97a4 never engages and every later render spawns
+/// another worker behind the same stale cache. Observed orphans held a socket
+/// for 20h. A statusline refresh is worthless long before 10s anyway.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// GitHub token from the environment. Prefers `GH_TOKEN` (gh's own override)
 /// then `GITHUB_TOKEN`.
@@ -28,6 +36,7 @@ fn agent() -> &'static ureq::Agent {
         use ureq::tls::{TlsConfig, TlsProvider};
         Config::builder()
             .tls_config(TlsConfig::builder().provider(TlsProvider::NativeTls).build())
+            .timeout_global(Some(HTTP_TIMEOUT))
             .build()
             .new_agent()
     })
@@ -137,4 +146,26 @@ pub fn pr_view_json(owner: &str, name: &str, branch: &str) -> Option<String> {
     pr.insert("statusCheckRollup".into(), Value::Array(rows));
 
     serde_json::to_string(&Value::Object(pr)).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guards the hang: a stalled request used to block in `recvfrom` forever,
+    /// orphaning the worker and starving the cache. 203.0.113.1 is TEST-NET-3 —
+    /// unroutable by definition, so it stalls the same way the real one did.
+    #[test]
+    fn agent_gives_up_instead_of_hanging() {
+        let start = std::time::Instant::now();
+        let r = agent()
+            .post("https://203.0.113.1/graphql")
+            .send_json(serde_json::json!({}));
+        let elapsed = start.elapsed();
+        assert!(r.is_err(), "unroutable address should not succeed");
+        assert!(
+            elapsed < HTTP_TIMEOUT + Duration::from_secs(5),
+            "took {elapsed:?} — global timeout did not fire"
+        );
+    }
 }
