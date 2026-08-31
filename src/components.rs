@@ -1829,7 +1829,7 @@ mod tests {
         let cfg = QuotasConfig {
             weekly: Some(BucketConfig {
                 common: crate::component::ComponentConfig {
-                    priority: 99,
+                    priority: Some(99),
                     ..crate::component::ComponentConfig::default()
                 },
                 ..BucketConfig::default()
@@ -1842,7 +1842,7 @@ mod tests {
             .as_ref()
             .map(|b| b.common.clone())
             .unwrap_or_default();
-        assert_eq!(bucket_common.priority, 99);
+        assert_eq!(bucket_common.priority, Some(99));
     }
 
     #[test]

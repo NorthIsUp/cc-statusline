@@ -20,7 +20,6 @@
 // schema, or on `if A { if B { ... } }` patterns that read more naturally
 // than `if A && B`.
 #![allow(
-    dead_code,
     clippy::collapsible_if,
     clippy::collapsible_match,
     clippy::unnecessary_cast,

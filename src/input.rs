@@ -100,9 +100,7 @@ impl Session {
         if session_id.is_empty() {
             session_id = "nosession".into();
         }
-        let cols = ["terminal", "width"]
-            .iter()
-            .find_map(|_| n_u32(&v, &["terminal", "width"]))
+        let cols = n_u32(&v, &["terminal", "width"])
             .or_else(|| n_u32(&v, &["terminal", "columns"]))
             .or_else(|| n_u32(&v, &["window", "columns"]))
             .or_else(|| n_u32(&v, &["cols"]))
