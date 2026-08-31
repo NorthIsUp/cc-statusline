@@ -138,9 +138,13 @@ struct change must come with a regenerated `config.schema.json`.
 2. Bump `version` in `Cargo.toml`.
 3. Commit and push to `main`.
 
-The `release.yml` workflow watches Cargo.toml on main, reads the new version,
-builds binaries for 5 targets, drops a `vX.Y.Z` tag, and publishes a GitHub
-release with the matching CHANGELOG section as the body and SHA256 checksums.
+The `ci.yml` workflow tests every push and pull request; on main it also reads
+the new version, builds the two Apple targets, drops a `vX.Y.Z` tag, and
+publishes a GitHub release with the matching CHANGELOG section as the body and
+SHA256 checksums.
+
+macOS only: the statusline links `objc2` (NSWorkspace, NSAppleScript) and calls
+Darwin-only `proc_pidinfo`/`devname`, so it does not build for Linux or Windows.
 
 ## License
 
