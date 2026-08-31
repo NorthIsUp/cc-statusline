@@ -225,3 +225,30 @@ impl State {
 pub fn fresh(at: i64, ttl: i64) -> bool {
     at > 0 && (now_epoch() - at) < ttl
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The foreground render must never wait on a background refresher's lock.
+    /// `try_acquire` returning `None` while the lock is held is what lets
+    /// `render_once` fall back to a lockless read instead of stalling.
+    #[test]
+    fn try_acquire_yields_none_while_locked() {
+        let id = "test-try-acquire-contended";
+        let held = StateLock::acquire_blocking(id).expect("first acquire");
+        assert!(
+            StateLock::try_acquire(id)
+                .expect("try_acquire is not an error")
+                .is_none(),
+            "try_acquire must not block or succeed while the lock is held"
+        );
+        drop(held);
+        assert!(
+            StateLock::try_acquire(id).expect("try_acquire").is_some(),
+            "lock must be reacquirable once released"
+        );
+        let _ = std::fs::remove_file(State::path(id));
+        let _ = std::fs::remove_file(State::path(id).with_extension("toml.lock"));
+    }
+}

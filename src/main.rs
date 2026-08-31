@@ -147,11 +147,14 @@ fn render_once() {
 
     // Hold an OS lock on the state file for the duration of the render so we
     // don't see a half-written file mid-update from a background refresher.
-    let mut handle = match state::StateLock::acquire_blocking(&session.session_id) {
-        Ok(h) => h,
-        Err(_) => {
-            // Lock acquisition failed (very rare). Fall back to lockless
-            // read-only render so the user still gets *something*.
+    //
+    // Never block for it: the statusline is on the user's interactive path, so
+    // a render that waits is worse than a render from slightly stale state.
+    let mut handle = match state::StateLock::try_acquire(&session.session_id) {
+        Ok(Some(h)) => h,
+        _ => {
+            // Contended or unopenable — render read-only from whatever is on
+            // disk. Costs this tick's state write (spinner frame, hysteresis).
             let st = state::State::load(&session.session_id);
             return render_with_state(&session, st);
         }

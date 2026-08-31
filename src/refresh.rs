@@ -114,21 +114,26 @@ fn spawn_self(args: &[&str], envs: &[(&str, &str)]) {
 
 pub fn run_refresh_pr(session_id: &str) {
     let cwd = std::env::var(ENV_CWD).unwrap_or_default();
-    let mut handle = match StateLock::acquire_blocking(session_id) {
-        Ok(h) => h,
-        Err(_) => return,
-    };
+    {
+        let mut handle = match StateLock::acquire_blocking(session_id) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
 
-    // Re-check freshness inside the lock — another worker may have already
-    // refreshed between our spawn and our acquire.
-    let ttl = config::config().pr_cache_ttl();
-    if state::fresh(handle.state.pr.fetched_at, ttl) && !handle.state.pr.json.is_empty() {
-        return;
+        // Re-check freshness inside the lock — another worker may have already
+        // refreshed between our spawn and our acquire.
+        let ttl = config::config().pr_cache_ttl();
+        if state::fresh(handle.state.pr.fetched_at, ttl) && !handle.state.pr.json.is_empty() {
+            return;
+        }
+
+        // Mark the in-flight lock so concurrent foregrounds know not to
+        // re-spawn, then release before the fetch: a foreground render
+        // blocks on this same lock, so holding it across a network
+        // round-trip stalls the statusline for the length of the request.
+        handle.state.pr.locked_at = now_epoch();
+        let _ = handle.save();
     }
-
-    // Mark the in-flight lock so concurrent foregrounds know not to re-spawn.
-    handle.state.pr.locked_at = now_epoch();
-    let _ = handle.save();
 
     // The PR for the current branch, fetched directly from GitHub's GraphQL
     // API (was `gh pr view --json …`). `repo_identity` recovers the
@@ -153,6 +158,13 @@ pub fn run_refresh_pr(session_id: &str) {
         None => Some("{}".into()), // no PR context → definitive empty
     };
 
+    // Re-acquire to commit the result. The state is re-read from disk here, so
+    // anything another worker wrote during the fetch is preserved.
+    let mut handle = match StateLock::acquire_blocking(session_id) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+
     match fetched {
         Some(body) => {
             handle.state.pr.json = body;
@@ -169,13 +181,16 @@ pub fn run_refresh_pr(session_id: &str) {
 
 pub fn run_refresh_other(session_id: &str) {
     let transcript = std::env::var(ENV_TRANSCRIPT).unwrap_or_default();
-    let mut handle = match StateLock::acquire_blocking(session_id) {
-        Ok(h) => h,
-        Err(_) => return,
-    };
-
-    handle.state.other_prs.locked_at = now_epoch();
-    let _ = handle.save();
+    {
+        // Stamp the debounce, then release before the scan — the transcript
+        // runs to tens of MB and a foreground render waits on this lock.
+        let mut handle = match StateLock::acquire_blocking(session_id) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        handle.state.other_prs.locked_at = now_epoch();
+        let _ = handle.save();
+    }
 
     // All PR URLs referenced in the transcript (created + linked), scanned
     // in-process — the equivalent of `cc-thread-prs --urls-only --all`. This
@@ -183,6 +198,11 @@ pub fn run_refresh_other(session_id: &str) {
     // conversation merely touched. The chips component collapses a large set
     // to a `×N` summary.
     let new_urls = crate::transcript::pr_urls_in_transcript(&transcript);
+
+    let mut handle = match StateLock::acquire_blocking(session_id) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
 
     // Detect newly-created PRs in this session and force-refresh the global
     // recent_prs cache so the chip lights up with state color immediately,
@@ -223,18 +243,27 @@ pub fn run_refresh_stack(session_id: &str) {
     if cwd.is_empty() {
         return;
     }
+    {
+        // Stamp the debounce, then release before shelling out to `gt` — a
+        // foreground render waits on this same lock.
+        let mut handle = match StateLock::acquire_blocking(session_id) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let ttl = config::config().stack_refresh_ttl();
+        if state::fresh(handle.state.stack.fetched_at, ttl) {
+            return;
+        }
+        handle.state.stack.locked_at = now_epoch();
+        let _ = handle.save();
+    }
+
+    let (is_gt, entries) = fetch_stack(&cwd);
+
     let mut handle = match StateLock::acquire_blocking(session_id) {
         Ok(h) => h,
         Err(_) => return,
     };
-    let ttl = config::config().stack_refresh_ttl();
-    if state::fresh(handle.state.stack.fetched_at, ttl) {
-        return;
-    }
-    handle.state.stack.locked_at = now_epoch();
-    let _ = handle.save();
-
-    let (is_gt, entries) = fetch_stack(&cwd);
     handle.state.stack.is_gt = is_gt;
     handle.state.stack.entries = entries;
     handle.state.stack.fetched_at = now_epoch();
