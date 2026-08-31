@@ -100,18 +100,14 @@ fn preview_all() {
         tick: 0,
     };
 
-    let name_w = components::ALL_NAMES
-        .iter()
-        .map(|n| n.len())
-        .max()
-        .unwrap_or(10);
+    let name_w = components::all_names().map(|n| n.len()).max().unwrap_or(10);
 
     println!(
         "\x1b[1mcc-statusline component preview\x1b[0m  ({} components)",
-        components::ALL_NAMES.len()
+        components::all_names().count()
     );
     println!();
-    for &name in components::ALL_NAMES {
+    for name in components::all_names() {
         let sizes = components::sizes_for(name).unwrap_or(&[]);
         let default = components::default_size_for(name);
         for &size in sizes {

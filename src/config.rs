@@ -170,49 +170,28 @@ impl Config {
         self.layout.clone().unwrap_or_default()
     }
 
-    /// Per-component common config. Returns the user-configured block or a
-    /// default if absent.
+    /// Per-component common config: the user's `[name]` block, or a default.
+    /// Which field each name maps to lives in the component registry — this
+    /// only keeps the `quotas.<bucket>` inheritance, which has no registry row
+    /// of its own.
     pub fn component_config(&self, name: &str) -> ComponentConfig {
-        let pick = |o: &Option<ComponentConfig>| o.clone().unwrap_or_default();
-        match name {
-            "repo" => pick(&self.repo),
-            "branch" => pick(&self.branch),
-            "pr_icon" => pick(&self.pr_icon),
-            "pr_num" => pick(&self.pr_num),
-            "ci" => pick(&self.ci),
-            "review" => pick(&self.review),
-            "comments" => pick(&self.comments),
-            "dirty" => pick(&self.dirty),
-            "ahead" => pick(&self.ahead),
-            "behind" => pick(&self.behind),
-            "ticket" => pick(&self.ticket),
-            "chips" => self.chips.common.clone(),
-            "burn" => self.burn.common.clone(),
-            "agents" => pick(&self.agents),
-            "quotas" => self.quotas.common.clone(),
-            n if crate::components::quotas_bucket_kind(n).is_some() => {
-                // Per-bucket layout knobs (priority/min/required/etc.) come
-                // from the `[quotas.<bucket>] common = ...` flattened fields
-                // when set; otherwise inherit the parent `[quotas]` common.
-                let bucket = crate::components::quotas_bucket_kind(n).unwrap();
-                let q = &self.quotas;
-                let bcfg = match bucket {
-                    crate::components::BucketKind::Hourly => &q.hourly,
-                    crate::components::BucketKind::Weekly => &q.weekly,
-                    crate::components::BucketKind::Design => &q.design,
-                    crate::components::BucketKind::Sonnet => &q.sonnet,
-                };
-                bcfg.as_ref()
-                    .map(|b| b.common.clone())
-                    .unwrap_or_else(|| q.common.clone())
-            }
-            "ctx_bar" => self.ctx_bar.common.clone(),
-            "loc" => pick(&self.loc),
-            "model" => pick(&self.model),
-            "effort" => pick(&self.effort),
-            "spinner" => pick(&self.spinner_cfg),
-            _ => ComponentConfig::default(),
+        if let Some(bucket) = crate::components::quotas_bucket_kind(name) {
+            // Per-bucket layout knobs (priority/min/required/etc.) come from
+            // the `[quotas.<bucket>] common = ...` flattened fields when set;
+            // otherwise inherit the parent `[quotas]` common.
+            let q = &self.quotas;
+            let bcfg = match bucket {
+                crate::components::BucketKind::Hourly => &q.hourly,
+                crate::components::BucketKind::Weekly => &q.weekly,
+                crate::components::BucketKind::Design => &q.design,
+                crate::components::BucketKind::Sonnet => &q.sonnet,
+            };
+            return bcfg
+                .as_ref()
+                .map(|b| b.common.clone())
+                .unwrap_or_else(|| q.common.clone());
         }
+        crate::components::common_config(self, name)
     }
 }
 
