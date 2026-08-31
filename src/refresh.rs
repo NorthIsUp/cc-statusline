@@ -359,58 +359,6 @@ fn depth_of(start: &str, parent: &std::collections::HashMap<String, Option<Strin
     d
 }
 
-/// Fetch states for many PRs in one GraphQL call instead of N `gh pr view`s.
-/// Each PR view is a single GraphQL query; batching them into aliased fields
-/// of one query brings N requests → 1, which is the difference between
-/// surviving and exhausting the 5000/hr GitHub API budget when many sessions
-/// each track several chips.
-fn fetch_other_states(urls: &[String]) -> String {
-    if urls.is_empty() {
-        return "{}".into();
-    }
-    // Build aliased query: pr0: repository(owner:"o", name:"r") { pullRequest(number: N) {...} }
-    let mut query = String::from("query {");
-    let mut url_by_alias: Vec<(String, String)> = Vec::new();
-    for (i, u) in urls.iter().enumerate() {
-        let (owner, name, num) = match parse_pr_url(u) {
-            Some(t) => t,
-            None => continue,
-        };
-        let alias = format!("pr{i}");
-        query.push_str(&format!(
-            r#"{alias}: repository(owner: "{owner}", name: "{name}") {{ pullRequest(number: {num}) {{ url state isDraft }} }} "#
-        ));
-        url_by_alias.push((alias, u.clone()));
-    }
-    query.push('}');
-
-    let v = match crate::github::graphql(&query) {
-        Some(v) => v,
-        None => return "{}".into(),
-    };
-    let data = match v.get("data") {
-        Some(d) => d,
-        None => return "{}".into(),
-    };
-
-    let mut acc = serde_json::Map::new();
-    for (alias, url) in url_by_alias {
-        let pr = match data.get(&alias).and_then(|r| r.get("pullRequest")) {
-            Some(p) if !p.is_null() => p,
-            _ => continue,
-        };
-        let mut entry = serde_json::Map::new();
-        if let Some(s) = pr.get("state") {
-            entry.insert("state".into(), s.clone());
-        }
-        if let Some(d) = pr.get("isDraft") {
-            entry.insert("isDraft".into(), d.clone());
-        }
-        acc.insert(url, serde_json::Value::Object(entry));
-    }
-    serde_json::to_string(&serde_json::Value::Object(acc)).unwrap_or_default()
-}
-
 /// Force the global recent-PRs cache to be considered stale on the next
 /// render, AND eagerly spawn a refresh worker now. Called when this session
 /// just created a PR, so the chip lights up with state color immediately.
@@ -420,12 +368,4 @@ fn invalidate_recent_prs() {
     cur.locked_at = 0;
     let _ = cur.save();
     crate::recent_prs::maybe_spawn_refresh();
-}
-
-fn parse_pr_url(u: &str) -> Option<(String, String, u64)> {
-    let rest = u.strip_prefix("https://github.com/")?;
-    let (repo, num_part) = rest.split_once("/pull/")?;
-    let (owner, name) = repo.split_once('/')?;
-    let num: u64 = num_part.split(['/', '?', '#']).next()?.parse().ok()?;
-    Some((owner.to_string(), name.to_string(), num))
 }

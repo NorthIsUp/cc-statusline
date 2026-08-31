@@ -394,6 +394,66 @@ fn fetch_chunk(chunk: &[(String, (String, String, u64))]) -> Option<HashMap<Stri
     Some(map)
 }
 
+const QUERY: &str = r#"query {
+  rateLimit { remaining }
+  viewer {
+    pullRequests(first: 100, orderBy: {field: UPDATED_AT, direction: DESC}, states: [OPEN, MERGED, CLOSED]) {
+      nodes { url state isDraft number mergedAt autoMergeRequest { __typename } }
+    }
+  }
+}"#;
+
+/// Returns `(prs, rateLimit.remaining)`. `remaining` is `None` when the field
+/// is absent (older API / unexpected shape); `rateLimit` itself costs 0 points.
+fn fetch() -> Option<(HashMap<String, PrEntry>, Option<i64>)> {
+    let v = crate::github::graphql(QUERY)?;
+    let remaining = v
+        .pointer("/data/rateLimit/remaining")
+        .and_then(Value::as_i64);
+    let nodes = v
+        .get("data")?
+        .get("viewer")?
+        .get("pullRequests")?
+        .get("nodes")?
+        .as_array()?;
+    let mut map = HashMap::with_capacity(nodes.len());
+    for n in nodes {
+        // Skip a node we can't key, rather than `?`-ing out of the whole
+        // fetch: one unusable entry used to discard all 100 and leave every
+        // chip uncoloured until the next TTL.
+        let url = match n.get("url").and_then(|x| x.as_str()) {
+            Some(u) => u.to_string(),
+            None => continue,
+        };
+        let state = n
+            .get("state")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let is_draft = n.get("isDraft").and_then(|x| x.as_bool()).unwrap_or(false);
+        let number = n.get("number").and_then(|x| x.as_u64()).unwrap_or(0);
+        let merged_at = n
+            .get("mergedAt")
+            .and_then(|x| x.as_str())
+            .and_then(crate::input::ts_to_epoch);
+        let auto_merge = n
+            .get("autoMergeRequest")
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
+        map.insert(
+            url,
+            PrEntry {
+                state,
+                is_draft,
+                number,
+                merged_at,
+                auto_merge,
+            },
+        );
+    }
+    Some((map, remaining))
+}
+
 #[cfg(test)]
 mod sweep_tests {
     use super::*;
@@ -512,58 +572,4 @@ mod tests {
         assert!(parse_pr_url("https://github.com/foo/bar/pull/abc").is_none());
         assert!(parse_pr_url("not a url").is_none());
     }
-}
-
-const QUERY: &str = r#"query {
-  rateLimit { remaining }
-  viewer {
-    pullRequests(first: 100, orderBy: {field: UPDATED_AT, direction: DESC}, states: [OPEN, MERGED, CLOSED]) {
-      nodes { url state isDraft number mergedAt autoMergeRequest { __typename } }
-    }
-  }
-}"#;
-
-/// Returns `(prs, rateLimit.remaining)`. `remaining` is `None` when the field
-/// is absent (older API / unexpected shape); `rateLimit` itself costs 0 points.
-fn fetch() -> Option<(HashMap<String, PrEntry>, Option<i64>)> {
-    let v = crate::github::graphql(QUERY)?;
-    let remaining = v
-        .pointer("/data/rateLimit/remaining")
-        .and_then(Value::as_i64);
-    let nodes = v
-        .get("data")?
-        .get("viewer")?
-        .get("pullRequests")?
-        .get("nodes")?
-        .as_array()?;
-    let mut map = HashMap::with_capacity(nodes.len());
-    for n in nodes {
-        let url = n.get("url").and_then(|x| x.as_str())?.to_string();
-        let state = n
-            .get("state")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string();
-        let is_draft = n.get("isDraft").and_then(|x| x.as_bool()).unwrap_or(false);
-        let number = n.get("number").and_then(|x| x.as_u64()).unwrap_or(0);
-        let merged_at = n
-            .get("mergedAt")
-            .and_then(|x| x.as_str())
-            .and_then(crate::input::ts_to_epoch);
-        let auto_merge = n
-            .get("autoMergeRequest")
-            .map(|v| !v.is_null())
-            .unwrap_or(false);
-        map.insert(
-            url,
-            PrEntry {
-                state,
-                is_draft,
-                number,
-                merged_at,
-                auto_merge,
-            },
-        );
-    }
-    Some((map, remaining))
 }
