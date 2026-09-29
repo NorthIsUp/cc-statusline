@@ -259,7 +259,7 @@ pub fn run_refresh_other(session_id: &str) {
     // captures PRs created out-of-band (e.g. via Graphite `gt`) and ones the
     // conversation merely touched. The chips component collapses a large set
     // to a `×N` summary.
-    let new_urls = crate::transcript::pr_urls_in_transcript(&transcript);
+    let (new_urls, latest) = crate::transcript::pr_urls_in_transcript(&transcript);
 
     let mut handle = match StateLock::acquire_blocking(session_id) {
         Ok(h) => h,
@@ -281,6 +281,9 @@ pub fn run_refresh_other(session_id: &str) {
         if !prev.contains(&u) {
             handle.state.other_prs.urls.push(u);
         }
+    }
+    if let Some(l) = latest {
+        handle.state.other_prs.latest = l;
     }
     handle.state.other_prs.fetched_at = now_epoch();
 

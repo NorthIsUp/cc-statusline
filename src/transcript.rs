@@ -12,19 +12,89 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::OnceLock;
 
-/// Every PR URL referenced anywhere in the transcript at `path`, with
+/// Every PR URL Claude *wrote about* in the transcript at `path`, with
 /// Graphite PR links (`app.graphite.com/github/pr/O/R/N`) normalised to the
 /// canonical `github.com/O/R/pull/N` form, deduped in first-appearance order.
 ///
-/// In-process equivalent of `cc-thread-prs --urls-only --all`: in that mode
-/// the helper's output reduces to "all PR URLs in the transcript" (its
-/// creation-signal set is always a subset of the full scan), so this plain
-/// scan is exact — verified byte-for-byte against the script.
-pub fn pr_urls_in_transcript(path: &str) -> Vec<String> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => scan_pr_urls(&text),
-        Err(_) => Vec::new(),
+/// Only assistant prose and what the human typed count. A URL that appears
+/// solely inside a `tool_result` is data the agent scrolled past, not a PR the
+/// conversation is about: one `gh pr list --json ...url` drops ~40 URLs into
+/// the transcript, and every one of them used to become a chip. Measured on
+/// the session that prompted this, the split was 1 relevant URL in assistant
+/// text against 49 in tool output.
+///
+/// ponytail: a PR created this turn lands in `gh pr create`'s tool_result
+/// first, so its chip waits until the assistant mentions the URL (usually the
+/// same turn) or the branch lookup finds it. Whitelisting creation commands is
+/// the upgrade if that lag ever shows.
+///
+/// Returns the URLs in first-appearance order plus the *last* one mentioned
+/// anywhere in the file — the PR the conversation is currently on, which the
+/// chips component renders bold.
+pub fn pr_urls_in_transcript(path: &str) -> (Vec<String>, Option<String>) {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => return (Vec::new(), None),
+    };
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    let mut latest = None;
+    for line in text.lines() {
+        for url in scan_pr_urls(&relevant_text(line)) {
+            latest = Some(url.clone());
+            if seen.insert(url.clone()) {
+                out.push(url);
+            }
+        }
     }
+    (out, latest)
+}
+
+/// The parts of one transcript JSONL line a PR URL may be harvested from:
+/// assistant/user `text` blocks only. System-reminders are stripped — they
+/// carry injected CLAUDE.md prose, whose example URLs are not the user's.
+fn relevant_text(line: &str) -> String {
+    let v: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    if !matches!(
+        v.get("type").and_then(Value::as_str),
+        Some("assistant" | "user")
+    ) {
+        return String::new();
+    }
+    let content = &v["message"]["content"];
+    let mut out = String::new();
+    match content {
+        Value::String(s) => out.push_str(s),
+        Value::Array(blocks) => {
+            for b in blocks {
+                if b.get("type").and_then(Value::as_str) == Some("text") {
+                    if let Some(t) = b.get("text").and_then(Value::as_str) {
+                        out.push_str(t);
+                        out.push('\n');
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    strip_system_reminders(&out)
+}
+
+fn strip_system_reminders(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("<system-reminder>") {
+        out.push_str(&rest[..i]);
+        rest = match rest[i..].find("</system-reminder>") {
+            Some(j) => &rest[i + j + "</system-reminder>".len()..],
+            None => "",
+        };
+    }
+    out.push_str(rest);
+    out
 }
 
 fn scan_pr_urls(text: &str) -> Vec<String> {
@@ -78,6 +148,8 @@ fn origin_to_repo(origin_url: &str) -> String {
 #[derive(Debug, Default)]
 pub struct OtherPrs {
     pub urls: Vec<String>,
+    /// The most recently mentioned PR in the transcript; rendered bold.
+    pub latest: String,
     pub states: HashMap<String, PrStateLite>,
     /// Whether the current worktree is a Graphite stack (gt log --json
     /// succeeded). When true, `stack_entries` is non-empty and trunk-first.
@@ -113,6 +185,23 @@ pub fn other_prs_view(st: &State, origin_url: &str) -> OtherPrs {
         .filter(|u| own_repo.is_empty() || url_repo(u).map(|r| r == own_repo).unwrap_or(false))
         .cloned()
         .collect();
+    // A stack is shown whole: every branch in it with a PR gets a chip, even
+    // one the conversation never mentioned. Half a stack is worse than none —
+    // the chain is the unit you reason about, and since chips are now
+    // harvested from chat text only, the siblings would otherwise vanish.
+    if !own_repo.is_empty() {
+        let seen: HashSet<&str> = out.urls.iter().map(String::as_str).collect();
+        let mut add: Vec<String> = Vec::new();
+        for e in &st.stack.entries {
+            if let Some(n) = e.pr {
+                let url = format!("https://github.com/{own_repo}/pull/{n}");
+                if !seen.contains(url.as_str()) && !add.contains(&url) {
+                    add.push(url);
+                }
+            }
+        }
+        out.urls.extend(add);
+    }
     // Hydrate state from the global recent_prs cache (one GraphQL call shared
     // across all sessions). PRs older than the recent 100 won't be in the
     // cache; their chips render dim, which is acceptable.
@@ -130,6 +219,7 @@ pub fn other_prs_view(st: &State, origin_url: &str) -> OtherPrs {
             );
         }
     }
+    out.latest = st.other_prs.latest.clone();
     out.is_gt = st.stack.is_gt;
     out.stack_entries = st
         .stack
@@ -275,6 +365,76 @@ mod tests {
                 "https://github.com/team/repo/pull/345".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn pr_urls_only_from_chat_text_not_tool_output() {
+        let lines = [
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"look at https://github.com/o/r/pull/1"}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"{\"url\":\"https://github.com/o/r/pull/99\"}"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"PR https://github.com/o/r/pull/2 is the one"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","input":{"command":"gh pr view https://github.com/o/r/pull/98"}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"<system-reminder>example https://github.com/org/repo/pull/44</system-reminder>ok"}]}}"#,
+            r#"{"type":"attachment","content":"https://github.com/org/repo/pull/97"}"#,
+            "not json",
+        ];
+        let dir = std::env::temp_dir().join(format!("cc-prurl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.jsonl");
+        std::fs::write(&p, lines.join("\n")).unwrap();
+        assert_eq!(
+            pr_urls_in_transcript(p.to_str().unwrap()).0,
+            vec![
+                "https://github.com/o/r/pull/1".to_string(),
+                "https://github.com/o/r/pull/2".to_string(),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stack_prs_join_chips_and_latest_is_last_mentioned() {
+        let mut st = State::default();
+        st.other_prs.urls = vec!["https://github.com/o/r/pull/1".into()];
+        st.other_prs.latest = "https://github.com/o/r/pull/1".into();
+        st.stack.is_gt = true;
+        st.stack.entries = vec![
+            crate::state::StackEntry {
+                branch: "a".into(),
+                pr: Some(7),
+                depth: 1,
+            },
+            crate::state::StackEntry {
+                branch: "b".into(),
+                pr: None,
+                depth: 2,
+            },
+        ];
+        let v = other_prs_view(&st, "git@github.com:o/r.git");
+        assert_eq!(
+            v.urls,
+            vec![
+                "https://github.com/o/r/pull/1".to_string(),
+                "https://github.com/o/r/pull/7".to_string(),
+            ]
+        );
+        assert_eq!(v.latest, "https://github.com/o/r/pull/1");
+    }
+
+    #[test]
+    fn latest_is_the_last_mention_not_the_first() {
+        let lines = [
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"https://github.com/o/r/pull/1"}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"now https://github.com/o/r/pull/2"}]}}"#,
+        ];
+        let dir = std::env::temp_dir().join(format!("cc-latest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.jsonl");
+        std::fs::write(&p, lines.join("\n")).unwrap();
+        let (urls, latest) = pr_urls_in_transcript(p.to_str().unwrap());
+        assert_eq!(urls.len(), 2);
+        assert_eq!(latest.unwrap(), "https://github.com/o/r/pull/2");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

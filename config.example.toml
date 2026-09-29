@@ -158,7 +158,7 @@ priority = 5
 #
 # stack_glyph = ""        # disable the leading marker
 # force_stack = true      # use stack layout even when `gt` is absent
-stack_separator   = "─•─"
+stack_separator   = "→"
 stack_glyph       = ""   # nf-oct-git_branch
 force_stack       = false
 stack_refresh_ttl = 60

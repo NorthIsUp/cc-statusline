@@ -90,6 +90,8 @@ pub struct OtherPrCache {
     pub fetched_at: i64,
     pub locked_at: i64,
     pub urls: Vec<String>,
+    /// Last PR URL mentioned in chat text — the one the conversation is on.
+    pub latest: String,
     /// Raw JSON object: {url -> {state, isDraft}}.
     pub states_json: String,
 }

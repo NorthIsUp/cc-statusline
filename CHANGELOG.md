@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- PR chips are harvested only from chat text — assistant prose and what
+  the user typed — instead of the whole transcript. A single
+  `gh pr list --json ...url` used to seed a chip per result: on the
+  session that prompted this, 1 relevant PR against 49 URLs that only
+  ever appeared inside tool output. System-reminder blocks are stripped
+  too, so example URLs injected from CLAUDE.md no longer become chips.
+
+### Added
+
+- A Graphite stack is always shown whole: every branch in it with a PR
+  gets a chip, whether or not the conversation mentioned it. Previously
+  stack mode only reordered chips the transcript had already produced.
+- The most recently mentioned PR renders bold, so the one the
+  conversation is on stands out from the rest of the chain.
+- The repo chip is an OSC-8 link to its forge page. Previously the bare
+  `owner/repo` text tripped iTerm2's own URL detection, so cmd-click
+  opened `http://owner/repo`. Handles `git@host:o/r.git`, `ssh://`,
+  and `https://` remotes on any host.
+
+### Changed
+
+- `chips.stack_separator` defaults to `→` rather than `─•─` — a stack
+  has a direction, trunk → leaf.
+
 ## [0.1.14] - 2026-04-30
 
 ### Fixed
