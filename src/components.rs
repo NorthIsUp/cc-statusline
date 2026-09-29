@@ -38,6 +38,26 @@ fn pretty_repo_full(origin_url: &str) -> String {
     }
 }
 
+/// `origin_url` as a browsable https URL, for the OSC-8 link on the repo chip.
+/// Without it iTerm2's own URL detection fires on the bare `owner/repo` text
+/// and opens `http://owner/repo`, which resolves to nothing.
+fn origin_web_url(origin_url: &str) -> Option<String> {
+    let s = origin_url.trim_end_matches('/').trim_end_matches(".git");
+    let rest = if let Some(r) = s.strip_prefix("git@") {
+        r.replacen(':', "/", 1)
+    } else if let Some(r) = s.strip_prefix("ssh://git@") {
+        r.into()
+    } else if let Some(r) = s.strip_prefix("https://") {
+        r.into()
+    } else if let Some(r) = s.strip_prefix("http://") {
+        r.into()
+    } else {
+        return None;
+    };
+    // host/owner/repo — anything shorter is not a browsable project page.
+    (rest.split('/').filter(|p| !p.is_empty()).count() >= 3).then(|| format!("https://{rest}"))
+}
+
 fn cwd_disp(ctx: &RenderCtx) -> String {
     let cwd = if !ctx.session.cwd.is_empty() {
         ctx.session.cwd.clone()
@@ -119,6 +139,9 @@ impl Component for Repo {
                 Size::Xl => pretty_repo_full(&ctx.git.origin_url),
                 _ => render_pretty_repo(&ctx.git.origin_url),
             };
+            if let Some(url) = origin_web_url(&ctx.git.origin_url) {
+                loc = link(&url, &loc);
+            }
             if size != Size::S {
                 loc.push_str(&worktree_suffix(ctx));
             }
@@ -451,7 +474,8 @@ pub struct ChipsConfig {
 impl Default for ChipsConfig {
     fn default() -> Self {
         Self {
-            stack_separator: "─•─".into(),
+            // Arrow, not a bullet: a stack has a direction, trunk → leaf.
+            stack_separator: "→".into(),
             // Default to the Nerd Font branch glyph; users can clear via "".
             stack_glyph: BRANCH.into(),
             force_stack: false,
@@ -641,7 +665,10 @@ fn stack_ordered_urls(
 fn render_chip(other: &crate::transcript::OtherPrs, url: &str) -> String {
     let n = url.rsplit('/').next().unwrap_or("");
     let c = pr_color_for(other, url);
-    link(url, &format!("{c}#{n}{RESET}"))
+    // Bold *after* the color: SGR 1 and 2 are the same attribute, so a DIM
+    // (unknown-state) chip would swallow the bold if the order were reversed.
+    let b = if url == other.latest { BOLD } else { "" };
+    link(url, &format!("{c}{b}#{n}{RESET}"))
 }
 
 impl Component for Chips {
@@ -1832,6 +1859,21 @@ mod tests {
     }
 
     #[test]
+    fn origin_web_url_forms() {
+        let want = Some("https://github.com/o/r".to_string());
+        assert_eq!(origin_web_url("git@github.com:o/r.git"), want);
+        assert_eq!(origin_web_url("https://github.com/o/r.git"), want);
+        assert_eq!(origin_web_url("ssh://git@github.com/o/r"), want);
+        assert_eq!(
+            origin_web_url("git@gitlab.com:group/sub/proj.git"),
+            Some("https://gitlab.com/group/sub/proj".to_string())
+        );
+        // No host, or nothing to browse to.
+        assert_eq!(origin_web_url("/srv/git/bare.git"), None);
+        assert_eq!(origin_web_url("https://github.com/o"), None);
+    }
+
+    #[test]
     fn quotas_dotted_default_priorities() {
         assert_eq!(default_priority("quotas"), 15);
         assert_eq!(default_priority("quotas.hourly"), 25);
@@ -1995,6 +2037,7 @@ mod tests {
     fn stack_other(urls: Vec<u32>, entries: Vec<crate::transcript::StackChipEntry>) -> OtherPrs {
         OtherPrs {
             urls: urls.into_iter().map(url).collect(),
+            latest: String::new(),
             states: Default::default(),
             is_gt: true,
             stack_entries: entries,
@@ -2166,6 +2209,7 @@ mod tests {
             states.into_iter().map(|(n, s)| (url(n), s)).collect();
         OtherPrs {
             urls: urls.into_iter().map(url).collect(),
+            latest: String::new(),
             states: url_map,
             is_gt: false,
             stack_entries: vec![],

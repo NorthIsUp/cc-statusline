@@ -492,7 +492,7 @@
           "format": "int64"
         },
         "stack_separator": {
-          "default": "─•─",
+          "default": "→",
           "type": "string"
         }
       }
