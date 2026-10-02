@@ -49,10 +49,8 @@ fn origin_web_url(origin_url: &str) -> Option<String> {
         r.into()
     } else if let Some(r) = s.strip_prefix("https://") {
         r.into()
-    } else if let Some(r) = s.strip_prefix("http://") {
-        r.into()
     } else {
-        return None;
+        s.strip_prefix("http://")?.into()
     };
     // host/owner/repo — anything shorter is not a browsable project page.
     (rest.split('/').filter(|p| !p.is_empty()).count() >= 3).then(|| format!("https://{rest}"))
