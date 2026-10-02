@@ -58,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "cc-statusline"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "git2",
  "libc",

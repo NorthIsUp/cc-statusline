@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- PR chips no longer go dim when their PR falls outside the recent-100
+  window. Each refresh used to discard last cycle's by-URL lookups and
+  refill only 40 of the gaps; it now keeps last-known state and fetches
+  every missing PR.
 - PR chips are harvested only from chat text — assistant prose and what
   the user typed — instead of the whole transcript. A single
   `gh pr list --json ...url` used to seed a chip per result: on the

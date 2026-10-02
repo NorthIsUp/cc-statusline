@@ -123,61 +123,55 @@ const MERGED_SETTLED_AFTER: i64 = 7 * 86_400;
 /// to look.
 const BATCH_MAX: usize = 40;
 
-/// The URLs to fetch this cycle: everything that *must* be refreshed, then the
-/// stalest entries we already hold, until the request is full.
+/// The URLs to fetch this cycle: everything missing, then the stalest entries
+/// we already hold, until the last request is full.
 ///
-/// The top-up is free — see `BATCH_MAX` — and every entry it refreshes is one
-/// that will not need a request of its own later. Settled merges are skipped:
-/// they are frozen, so spending a slot on one buys nothing.
+/// Missing URLs are never truncated: a capped list left the overflow dim every
+/// cycle (196 missing against a cap of 40 observed). The top-up is free — see
+/// `BATCH_MAX` — and every entry it refreshes is one that will not need a
+/// request of its own later. Settled merges are skipped: they are frozen.
 fn fetch_list(
     missing: &[String],
     have: &HashMap<String, PrEntry>,
     now: i64,
     cap: usize,
 ) -> Vec<String> {
-    let mut out: Vec<String> = missing.iter().take(cap).cloned().collect();
-    if out.len() >= cap {
-        return out;
-    }
+    let mut out: Vec<String> = missing.to_vec();
+    let target = out.len().div_ceil(cap).max(1) * cap;
 
     let already: std::collections::HashSet<&str> = out.iter().map(String::as_str).collect();
     let mut candidates: Vec<(i64, &String)> = have
         .iter()
-        .filter(|(url, e)| {
-            let settled =
-                e.state == "MERGED" && e.merged_at.is_some_and(|t| now - t >= MERGED_SETTLED_AFTER);
-            !already.contains(url.as_str()) && !settled
-        })
+        .filter(|(url, e)| !already.contains(url.as_str()) && !settled(e, now))
         .map(|(url, e)| (e.checked_at, url))
         .collect();
     // Stalest first; url breaks ties so the order is deterministic.
     candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
 
-    for (_, url) in candidates.into_iter().take(cap - out.len()) {
-        out.push(url.clone());
-    }
+    let room = target - out.len();
+    out.extend(candidates.into_iter().take(room).map(|(_, u)| u.clone()));
     out
 }
 
-/// Seed `fresh` with every entry in `prev` that has settled — merged, and
-/// merged long enough ago that nothing about it can still change.
+fn settled(e: &PrEntry, now: i64) -> bool {
+    e.state == "MERGED" && e.merged_at.is_some_and(|t| now - t >= MERGED_SETTLED_AFTER)
+}
+
+/// An unsettled entry not re-read within this window is dropped rather than
+/// carried, so a URL no session references any more eventually leaves the
+/// cache. A still-referenced one is just re-fetched as missing.
+const CARRY_UNSETTLED_FOR: i64 = 24 * 60 * 60;
+
+/// Seed `fresh` with what `prev` already knew, so a PR outside the recent-100
+/// `viewer` window keeps serving its last-known state instead of going dim.
 ///
-/// Without this, every PR outside the recent-100 `viewer` window was re-fetched
-/// *and then discarded* on each cycle: `fetch()` returns only that window, so
-/// the next cache was rebuilt from it and the previous cycle's lookups were
-/// thrown away. Measured on a live cache, 78 of 104 entries were MERGED —
-/// most of that work re-asking a question whose answer cannot change.
-///
-/// Recently-merged PRs are deliberately *not* frozen: they still sit in the
-/// viewer window, so re-reading them is free, and their `merged_at` is what
-/// the chip-collapse rules key on. CLOSED is never carried — it can reopen.
-fn carry_terminal(prev: &HashMap<String, PrEntry>, fresh: &mut HashMap<String, PrEntry>, now: i64) {
+/// `fetch()` returns only that window, so without this every by-URL lookup was
+/// thrown away on the next cycle and had to be re-fetched from scratch. Settled
+/// merges carry forever; anything else carries while it was re-read within
+/// `CARRY_UNSETTLED_FOR`. A fresh fetch always wins.
+fn carry_known(prev: &HashMap<String, PrEntry>, fresh: &mut HashMap<String, PrEntry>, now: i64) {
     for (url, entry) in prev {
-        let settled = entry.state == "MERGED"
-            && entry
-                .merged_at
-                .is_some_and(|t| now - t >= MERGED_SETTLED_AFTER);
-        if settled {
+        if settled(entry, now) || now - entry.checked_at < CARRY_UNSETTLED_FOR {
             fresh.entry(url.clone()).or_insert_with(|| entry.clone());
         }
     }
@@ -298,7 +292,7 @@ pub fn run_refresh() {
     sweep_orphan_sidecars(&config::cache_dir());
 
     if let Some((mut prs, remaining)) = fetch() {
-        carry_terminal(&cur.prs, &mut prs, now_epoch());
+        carry_known(&cur.prs, &mut prs, now_epoch());
 
         // Second pass: hydrate any URLs referenced by other_prs.urls in any
         // session state file that aren't already present in the freshly
@@ -483,10 +477,8 @@ pub(crate) fn parse_pr_url(url: &str) -> Option<(String, String, u64)> {
 
 /// Batched PR-by-(owner,repo,number) lookup using aliased `repository.pullRequest`
 /// fields. Each chunk is one GraphQL query of single-object lookups (no
-/// `first`/`last` connection), so it costs ~1 rate-limit point regardless of
-/// how many aliases it packs — fewer, larger chunks means fewer points. 100
-/// stays well within GraphQL's node/complexity caps while halving the query
-/// count vs the old 50. A failed alias inside an otherwise-successful batch is
+/// `first`/`last` connection), chunked at `BATCH_MAX` — the largest size that
+/// still costs 1 point. A failed alias inside an otherwise-successful batch is
 /// skipped silently.
 fn fetch_by_urls(urls: &[String]) -> HashMap<String, PrEntry> {
     let mut out = HashMap::new();
@@ -494,7 +486,7 @@ fn fetch_by_urls(urls: &[String]) -> HashMap<String, PrEntry> {
         .iter()
         .filter_map(|u| parse_pr_url(u).map(|p| (u.clone(), p)))
         .collect();
-    for chunk in parsed.chunks(100) {
+    for chunk in parsed.chunks(BATCH_MAX) {
         if let Some(map) = fetch_chunk(chunk) {
             out.extend(map);
         }
@@ -756,55 +748,50 @@ mod carry_tests {
         }
     }
 
-    /// Merged over a week ago: settled, so it is carried forward and never
-    /// listed as missing again.
+    /// Merged over a week ago: settled, so it carries however long ago it was
+    /// last read.
     #[test]
     fn settled_merge_is_carried_forward() {
         let mut prev = HashMap::new();
-        prev.insert("u1".to_string(), entry("MERGED", 1, Some(8 * 86_400)));
+        let mut e = entry("MERGED", 1, Some(8 * 86_400));
+        e.checked_at = 0;
+        prev.insert("u1".to_string(), e);
         let mut fresh = HashMap::new();
 
-        carry_terminal(&prev, &mut fresh, NOW);
+        carry_known(&prev, &mut fresh, NOW);
 
         assert_eq!(fresh.len(), 1, "settled merge must be carried");
     }
 
-    /// Merged recently: still inside the viewer window, so re-reading is free
-    /// and we do not freeze it.
+    /// Outside the viewer window but read recently: serve the last-known state
+    /// rather than dropping it and rendering the chip dim. This is the bug.
     #[test]
-    fn recent_merge_is_not_frozen() {
+    fn recently_read_entries_are_carried() {
         let mut prev = HashMap::new();
         prev.insert("u1".to_string(), entry("MERGED", 1, Some(2 * 86_400)));
-        let mut fresh = HashMap::new();
-
-        carry_terminal(&prev, &mut fresh, NOW);
-
-        assert!(fresh.is_empty(), "recent merge should not be frozen");
-    }
-
-    /// Undated merges are never frozen — we cannot show they have settled.
-    #[test]
-    fn undated_merge_is_not_frozen() {
-        let mut prev = HashMap::new();
-        prev.insert("u1".to_string(), entry("MERGED", 1, None));
-        let mut fresh = HashMap::new();
-
-        carry_terminal(&prev, &mut fresh, NOW);
-
-        assert!(fresh.is_empty(), "undated merge should not be frozen");
-    }
-
-    /// CLOSED and OPEN are never terminal — a closed PR can be reopened.
-    #[test]
-    fn non_terminal_states_are_not_carried() {
-        let mut prev = HashMap::new();
-        prev.insert("u2".to_string(), entry("CLOSED", 2, Some(8 * 86_400)));
+        prev.insert("u2".to_string(), entry("MERGED", 2, None));
         prev.insert("u3".to_string(), entry("OPEN", 3, None));
+        prev.insert("u4".to_string(), entry("CLOSED", 4, None));
         let mut fresh = HashMap::new();
 
-        carry_terminal(&prev, &mut fresh, NOW);
+        carry_known(&prev, &mut fresh, NOW);
 
-        assert!(fresh.is_empty(), "only settled merges carry, got {fresh:?}");
+        assert_eq!(fresh.len(), 4, "got {fresh:?}");
+    }
+
+    /// Unsettled and not re-read for a day: dropped, so unreferenced URLs age
+    /// out of the cache.
+    #[test]
+    fn long_unread_unsettled_entries_drop() {
+        let mut prev = HashMap::new();
+        let mut e = entry("OPEN", 1, None);
+        e.checked_at = NOW - CARRY_UNSETTLED_FOR;
+        prev.insert("u1".to_string(), e);
+        let mut fresh = HashMap::new();
+
+        carry_known(&prev, &mut fresh, NOW);
+
+        assert!(fresh.is_empty());
     }
 
     /// A fresh fetch always wins over the cached copy.
@@ -815,7 +802,7 @@ mod carry_tests {
         let mut fresh = HashMap::new();
         fresh.insert("u4".to_string(), entry("OPEN", 4, None));
 
-        carry_terminal(&prev, &mut fresh, NOW);
+        carry_known(&prev, &mut fresh, NOW);
 
         assert_eq!(
             fresh["u4"].state, "OPEN",
@@ -911,15 +898,18 @@ mod fill_tests {
         assert_eq!(got.len(), BATCH_MAX);
     }
 
-    /// More missing than the cap: they are truncated, not dropped silently
-    /// alongside a top-up that would push the request over.
+    /// More missing than the cap: every one is fetched, never truncated — the
+    /// overflow used to stay dim forever. The last request is topped up full.
     #[test]
-    fn missing_alone_can_fill_the_request() {
-        let have = HashMap::new();
+    fn missing_is_never_truncated() {
+        let mut have = HashMap::new();
+        for i in 0..100 {
+            have.insert(format!("u{i}"), e("OPEN", None, i as i64));
+        }
         let missing: Vec<String> = (0..60).map(|i| format!("m{i}")).collect();
         let got = fetch_list(&missing, &have, NOW, BATCH_MAX);
-        assert_eq!(got.len(), BATCH_MAX);
-        assert!(got.iter().all(|u| u.starts_with('m')));
+        assert_eq!(got.len(), 2 * BATCH_MAX);
+        assert!(missing.iter().all(|m| got.contains(m)));
     }
 
     /// No duplicates: a URL that is both missing and already held must not
