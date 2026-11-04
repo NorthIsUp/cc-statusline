@@ -1,86 +1,41 @@
 // Transcript-derived metrics: token burn rate, agent counter, "other PRs"
-// chips. Caches live in the per-session state TOML; PR-related data is
-// refreshed asynchronously by `refresh::run_refresh_other`. The local
-// transcript scans (burn, agents) run inline since they only touch a local
-// file and use mtime-keyed caching.
+// chips. Each render parses only the lines appended since the last one (see
+// `read_tail`) and folds them into the per-session state TOML.
 
 use crate::input::Session;
-use crate::state::{State, TranscriptScan};
+use crate::state::{OtherPrCache, State, TranscriptScan};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::OnceLock;
 
-/// Every PR URL Claude *wrote about* in the transcript at `path`, with
-/// Graphite PR links (`app.graphite.com/github/pr/O/R/N`) normalised to the
-/// canonical `github.com/O/R/pull/N` form, deduped in first-appearance order.
-///
-/// Only assistant prose and what the human typed count. A URL that appears
-/// solely inside a `tool_result` is data the agent scrolled past, not a PR the
-/// conversation is about: one `gh pr list --json ...url` drops ~40 URLs into
-/// the transcript, and every one of them used to become a chip. Measured on
-/// the session that prompted this, the split was 1 relevant URL in assistant
-/// text against 49 in tool output.
-///
-/// ponytail: a PR created this turn lands in `gh pr create`'s tool_result
-/// first, so its chip waits until the assistant mentions the URL (usually the
-/// same turn) or the branch lookup finds it. Whitelisting creation commands is
-/// the upgrade if that lag ever shows.
-///
-/// Returns the URLs in first-appearance order plus the *last* one mentioned
-/// anywhere in the file — the PR the conversation is currently on, which the
-/// chips component renders bold.
-pub fn pr_urls_in_transcript(path: &str, offset: u64) -> (Vec<String>, Option<String>, u64) {
-    let (text, _, end) = match read_tail(path, offset) {
-        Some(t) => t,
-        None => return (Vec::new(), None, offset),
-    };
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    let mut latest = None;
-    for line in text.lines() {
-        for url in scan_pr_urls(&relevant_text(line)) {
-            latest = Some(url.clone());
-            if seen.insert(url.clone()) {
-                out.push(url);
-            }
-        }
-    }
-    (out, latest, end)
-}
-
-/// The complete lines appended to `path` since byte `offset`, plus where they
-/// start and end. A file shorter than `offset` was rewritten, so it is read
-/// from 0 and `start != offset` tells the caller to drop its totals. A partial
-/// last line is left for the next call.
+/// The complete lines appended to `path` since `scan.offset`, advancing it. A
+/// file shorter than the offset was rewritten, so the totals restart from 0. A
+/// partial last line is left for the next call.
 ///
 /// shortcut: a rewrite that leaves the file longer than `offset` reads as an
 /// append. Claude Code only appends today; store a hash of the first line to
 /// catch rewrites if that changes.
-fn read_tail(path: &str, offset: u64) -> Option<(String, u64, u64)> {
+fn read_tail(path: &str, scan: &mut TranscriptScan) -> Option<String> {
     let mut f = File::open(path).ok()?;
-    let start = if f.metadata().ok()?.len() < offset {
-        0
-    } else {
-        offset
-    };
-    f.seek(SeekFrom::Start(start)).ok()?;
+    if f.metadata().ok()?.len() < scan.offset {
+        *scan = TranscriptScan::default();
+    }
+    f.seek(SeekFrom::Start(scan.offset)).ok()?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf).ok()?;
     let len = buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
     buf.truncate(len);
-    Some((String::from_utf8(buf).ok()?, start, start + len as u64))
+    let text = String::from_utf8(buf).ok()?;
+    scan.offset += len as u64;
+    Some(text)
 }
 
 /// The parts of one transcript JSONL line a PR URL may be harvested from:
 /// assistant/user `text` blocks only. System-reminders are stripped — they
 /// carry injected CLAUDE.md prose, whose example URLs are not the user's.
-fn relevant_text(line: &str) -> String {
-    let v: Value = match serde_json::from_str(line) {
-        Ok(v) => v,
-        Err(_) => return String::new(),
-    };
+fn relevant_text(v: &Value) -> String {
     if !matches!(
         v.get("type").and_then(Value::as_str),
         Some("assistant" | "user")
@@ -263,27 +218,22 @@ pub struct BurnInfo {
     pub tokens_total: u64,
 }
 
-/// Burn and agent totals, advanced by parsing only the transcript lines added
-/// since the last render. Reparsing the whole file on every change cost ~80ms
-/// of foreground CPU per turn on a 37MB transcript, times every session.
+/// Burn, agent and PR-link totals, advanced by parsing only the transcript
+/// lines added since the last render. Reparsing the whole file on every change
+/// cost ~80ms of foreground CPU per turn on a 37MB transcript, times every
+/// session.
 pub fn scan(session: &Session, st: &mut State) -> (BurnInfo, AgentCount) {
-    let mut burn = BurnInfo::default();
-    let mut agents = AgentCount::default();
-    if session.transcript.is_empty() {
-        return (burn, agents);
-    }
-
-    if let Some((text, start, end)) = read_tail(&session.transcript, st.transcript.offset) {
-        if start != st.transcript.offset {
-            st.transcript = TranscriptScan::default();
+    if let Some(text) = read_tail(&session.transcript, &mut st.transcript) {
+        if accumulate(&mut st.transcript, &mut st.other_prs, &text) {
+            crate::recent_prs::invalidate();
         }
-        accumulate(&mut st.transcript, &text);
-        st.transcript.offset = end;
     }
 
-    agents.active = st.transcript.open_agents.len() as u32;
-    agents.total = st.transcript.agents_total;
-
+    let agents = AgentCount {
+        active: st.transcript.open_agents.len() as u32,
+        total: st.transcript.agents_total,
+    };
+    let mut burn = BurnInfo::default();
     // Burn needs a minute of wall time before a rate means anything.
     if session.duration_ms > 60_000 && st.transcript.tokens > 0 {
         burn.tokens_total = st.transcript.tokens;
@@ -297,15 +247,27 @@ pub fn scan(session: &Session, st: &mut State) -> (BurnInfo, AgentCount) {
     (burn, agents)
 }
 
-/// Fold JSONL `text` into the running totals: one JSON parse per line, both
-/// metrics from the same pass.
-fn accumulate(scan: &mut TranscriptScan, text: &str) {
-    let mut open: HashSet<String> = scan.open_agents.drain(..).collect();
+/// Fold JSONL `text` into the running totals, one JSON parse per line feeding
+/// all three metrics. True when a PR URL appeared for the first time.
+///
+/// PR URLs come from chat text only: one `gh pr list --json url` puts ~40 URLs
+/// in a tool_result, and those are PRs the agent scrolled past, not ones the
+/// conversation is about. A PR created this turn waits for the assistant to
+/// mention its URL (usually the same turn) or for the branch lookup.
+fn accumulate(scan: &mut TranscriptScan, prs: &mut OtherPrCache, text: &str) -> bool {
+    let mut new_pr = false;
     for line in text.lines() {
         let v: Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(_) => continue,
         };
+        for url in scan_pr_urls(&relevant_text(&v)) {
+            if !prs.urls.contains(&url) {
+                prs.urls.push(url.clone());
+                new_pr = true;
+            }
+            prs.latest = url;
+        }
         let msg = match v.get("message") {
             Some(m) => m,
             None => continue,
@@ -326,22 +288,21 @@ fn accumulate(scan: &mut TranscriptScan, text: &str) {
                 "tool_use" => {
                     if item.get("name").and_then(|x| x.as_str()) == Some("Agent") {
                         if let Some(id) = item.get("id").and_then(|x| x.as_str()) {
-                            open.insert(id.to_string());
+                            scan.open_agents.insert(id.to_string());
                             scan.agents_total += 1;
                         }
                     }
                 }
                 "tool_result" => {
                     if let Some(id) = item.get("tool_use_id").and_then(|x| x.as_str()) {
-                        open.remove(id);
+                        scan.open_agents.remove(id);
                     }
                 }
                 _ => {}
             }
         }
     }
-    scan.open_agents = open.into_iter().collect();
-    scan.open_agents.sort();
+    new_pr
 }
 
 #[derive(Debug, Default)]
@@ -382,18 +343,13 @@ mod tests {
             r#"{"type":"attachment","content":"https://github.com/org/repo/pull/97"}"#,
             "not json",
         ];
-        let dir = std::env::temp_dir().join(format!("cc-prurl-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("t.jsonl");
-        std::fs::write(&p, lines.join("\n") + "\n").unwrap();
         assert_eq!(
-            pr_urls_in_transcript(p.to_str().unwrap(), 0).0,
+            folded(&lines.join("\n")).1.urls,
             vec![
                 "https://github.com/o/r/pull/1".to_string(),
                 "https://github.com/o/r/pull/2".to_string(),
             ]
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -431,14 +387,9 @@ mod tests {
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"https://github.com/o/r/pull/1"}]}}"#,
             r#"{"type":"user","message":{"content":[{"type":"text","text":"now https://github.com/o/r/pull/2"}]}}"#,
         ];
-        let dir = std::env::temp_dir().join(format!("cc-latest-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("t.jsonl");
-        std::fs::write(&p, lines.join("\n") + "\n").unwrap();
-        let (urls, latest, _) = pr_urls_in_transcript(p.to_str().unwrap(), 0);
-        assert_eq!(urls.len(), 2);
-        assert_eq!(latest.unwrap(), "https://github.com/o/r/pull/2");
-        let _ = std::fs::remove_dir_all(&dir);
+        let (_, prs) = folded(&lines.join("\n"));
+        assert_eq!(prs.urls.len(), 2);
+        assert_eq!(prs.latest, "https://github.com/o/r/pull/2");
     }
 
     #[test]
@@ -446,10 +397,11 @@ mod tests {
         assert!(scan_pr_urls("no links here").is_empty());
     }
 
-    fn scanned(text: &str) -> TranscriptScan {
+    fn folded(text: &str) -> (TranscriptScan, OtherPrCache) {
         let mut scan = TranscriptScan::default();
-        accumulate(&mut scan, text);
-        scan
+        let mut prs = OtherPrCache::default();
+        accumulate(&mut scan, &mut prs, text);
+        (scan, prs)
     }
 
     /// The merged pass must still total usage across every shape of line and
@@ -457,7 +409,7 @@ mod tests {
     /// two Agents dispatched, one returned, so one stays open.
     #[test]
     fn accumulate_totals_tokens_and_pairs_agents() {
-        let got = scanned(
+        let (got, _) = folded(
             &[
                 r#"{"message":{"usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":1,"cache_read_input_tokens":2}}}"#,
                 r#"{"message":{"content":[{"type":"tool_use","name":"Agent","id":"a1"},{"type":"tool_use","name":"Bash","id":"b1"}]}}"#,
@@ -469,7 +421,7 @@ mod tests {
             .join("\n"),
         );
         assert_eq!(got.tokens, 25); // 10+5+1+2 then +7
-        assert_eq!(got.open_agents, vec!["a2".to_string()]); // a1 returned
+        assert_eq!(got.open_agents, ["a2".to_string()].into()); // a1 returned
         assert_eq!(got.agents_total, 2); // Bash is not an Agent
     }
 
@@ -478,7 +430,7 @@ mod tests {
     /// that skips the other metric.
     #[test]
     fn accumulate_counts_both_metrics_on_one_line() {
-        let got = scanned(
+        let (got, _) = folded(
             r#"{"message":{"usage":{"input_tokens":3},"content":[{"type":"tool_use","name":"Agent","id":"x"}]}}"#,
         );
         assert_eq!(got.tokens, 3, "usage on an Agent line must still count");
@@ -516,7 +468,7 @@ mod tests {
         scan(&session, &mut st);
         let full = TranscriptScan {
             offset: std::fs::metadata(&p).unwrap().len(),
-            ..scanned(&format!("{open}\n{close}\n"))
+            ..folded(&format!("{open}\n{close}\n")).0
         };
         assert_eq!(st.transcript, full);
         assert_eq!(
@@ -530,25 +482,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The URL scan resumes where it stopped: a second call sees only the new
-    /// mention, and its offset covers the whole file.
+    /// Only a PR the session has never mentioned triggers the recent-PRs
+    /// refresh; a repeat mention just moves `latest`, and chips seen before a
+    /// transcript rewrite stay in the list.
     #[test]
-    fn pr_urls_resume_from_offset() {
-        let dir = std::env::temp_dir().join(format!("cc-prtail-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("t.jsonl");
+    fn accumulate_flags_only_new_prs() {
         let say = |n: u32| {
             format!(
                 r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"https://github.com/o/r/pull/{n}"}}]}}}}"#
             )
         };
-        std::fs::write(&p, say(1) + "\n").unwrap();
-        let (_, _, off) = pr_urls_in_transcript(p.to_str().unwrap(), 0);
-        std::fs::write(&p, say(1) + "\n" + &say(2) + "\n").unwrap();
-        let (urls, latest, end) = pr_urls_in_transcript(p.to_str().unwrap(), off);
-        assert_eq!(urls, vec!["https://github.com/o/r/pull/2".to_string()]);
-        assert_eq!(latest.unwrap(), "https://github.com/o/r/pull/2");
-        assert_eq!(end, std::fs::metadata(&p).unwrap().len());
-        let _ = std::fs::remove_dir_all(&dir);
+        let mut scan = TranscriptScan::default();
+        let mut prs = OtherPrCache::default();
+        assert!(accumulate(
+            &mut scan,
+            &mut prs,
+            &format!("{}\n{}", say(1), say(2))
+        ));
+        assert!(!accumulate(&mut scan, &mut prs, &say(1)));
+        assert_eq!(prs.latest, "https://github.com/o/r/pull/1");
+
+        scan = TranscriptScan::default(); // what read_tail does on a rewrite
+        assert!(!accumulate(&mut scan, &mut prs, &say(2)));
+        assert_eq!(prs.urls.len(), 2);
     }
 }

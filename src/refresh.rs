@@ -1,5 +1,5 @@
 // Background refresh entry points. The foreground render spawns a detached
-// copy of ourselves with `--refresh-pr <id>` or `--refresh-other <id>` when
+// copy of ourselves with `--refresh-pr <id>` or `--refresh-stack <id>` when
 // the corresponding cache is stale and not already locked.
 //
 // Locking debounces concurrent refreshes: the first spawned process gets the
@@ -12,7 +12,6 @@ use crate::state::{self, StateLock};
 use std::process::{Command, Stdio};
 
 const ENV_CWD: &str = "CC_STATUSLINE_REFRESH_CWD";
-const ENV_TRANSCRIPT: &str = "CC_STATUSLINE_REFRESH_TRANSCRIPT";
 const ENV_STACK_CWD: &str = "CC_STATUSLINE_STACK_CWD";
 
 /// A merged PR is re-checked at most once a day…
@@ -78,22 +77,6 @@ pub fn maybe_spawn_pr(session_id: &str, cwd: &str, st: &state::State) {
         return;
     }
     spawn_self(&["--refresh-pr", session_id], &[(ENV_CWD, cwd)]);
-}
-
-pub fn maybe_spawn_other(session_id: &str, transcript: &str, st: &state::State) {
-    // Only when the transcript grew (or shrank, on a rewrite) past what the
-    // last scan covered: an idle session costs one stat per render.
-    let len = match std::fs::metadata(transcript) {
-        Ok(m) => m.len(),
-        Err(_) => return,
-    };
-    if len == st.other_prs.offset || state::fresh(st.other_prs.locked_at, 30) {
-        return;
-    }
-    spawn_self(
-        &["--refresh-other", session_id],
-        &[(ENV_TRANSCRIPT, transcript)],
-    );
 }
 
 /// Spawn an async refresh of the Graphite stack snapshot for `cwd`. Uses the
@@ -236,63 +219,6 @@ pub fn run_refresh_pr(session_id: &str) {
     let _ = handle.save();
 }
 
-pub fn run_refresh_other(session_id: &str) {
-    let transcript = std::env::var(ENV_TRANSCRIPT).unwrap_or_default();
-    let offset = {
-        // Stamp the debounce, then release before the scan — a foreground
-        // render waits on this lock.
-        let mut handle = match StateLock::acquire_blocking(session_id) {
-            Ok(h) => h,
-            Err(_) => return,
-        };
-        handle.state.other_prs.locked_at = now_epoch();
-        let _ = handle.save();
-        handle.state.other_prs.offset
-    };
-
-    // PR URLs in the lines appended since the last scan. Claude Code appends
-    // to the transcript, so the URL list is a running union; a shorter file
-    // (rewritten) is rescanned from the start, and the union keeps old chips.
-    let (new_urls, latest, offset) = crate::transcript::pr_urls_in_transcript(&transcript, offset);
-
-    let mut handle = match StateLock::acquire_blocking(session_id) {
-        Ok(h) => h,
-        Err(_) => return,
-    };
-
-    // Detect newly-created PRs in this session and force-refresh the global
-    // recent_prs cache so the chip lights up with state color immediately,
-    // instead of waiting up to `recent_prs_ttl` seconds.
-    let prev: std::collections::HashSet<String> =
-        handle.state.other_prs.urls.iter().cloned().collect();
-    let has_new = new_urls.iter().any(|u| !prev.contains(u));
-
-    // Union: keep all previously-seen URLs (so /compact rewriting the
-    // transcript doesn't drop chip history) and append any new ones in
-    // discovery order. Chips never age out — the chips component collapses
-    // to a `×N` summary when there are too many to render.
-    for u in new_urls {
-        if !prev.contains(&u) {
-            handle.state.other_prs.urls.push(u);
-        }
-    }
-    if let Some(l) = latest {
-        handle.state.other_prs.latest = l;
-    }
-    handle.state.other_prs.offset = offset;
-    handle.state.other_prs.fetched_at = now_epoch();
-
-    if has_new {
-        invalidate_recent_prs();
-    }
-
-    // States are now hydrated from the global recent_prs cache, which is
-    // refreshed by `--refresh-recent-prs` in one GraphQL call shared across
-    // sessions. We just record the URL list and exit.
-    handle.state.other_prs.locked_at = 0;
-    let _ = handle.save();
-}
-
 /// Async Graphite stack refresh. Runs `gt log --json` in $CWD; on success,
 /// flattens the JSON into a trunk-first list of `StackEntry`. On any failure
 /// (gt missing, non-zero exit, malformed JSON), `is_gt` stays `false` so the
@@ -422,14 +348,6 @@ fn depth_of(start: &str, parent: &std::collections::HashMap<String, Option<Strin
 /// Force the global recent-PRs cache to be considered stale on the next
 /// render, AND eagerly spawn a refresh worker now. Called when this session
 /// just created a PR, so the chip lights up with state color immediately.
-fn invalidate_recent_prs() {
-    let mut cur = crate::recent_prs::RecentPrs::load();
-    cur.fetched_at = 0;
-    cur.locked_at = 0;
-    let _ = cur.save();
-    crate::recent_prs::maybe_spawn_refresh();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

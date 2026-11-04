@@ -11,7 +11,7 @@
 //
 // Subcommands (used by the foreground render to fan out async refreshes):
 //   cc-statusline --refresh-pr    <session_id>
-//   cc-statusline --refresh-other <session_id>
+//   cc-statusline --refresh-stack <session_id>
 
 // Allow some clippy lints that fight with serde-default fields and the
 // stylistic preferences of this codebase. Real bugs (unwraps, dead branches,
@@ -41,18 +41,9 @@ fn main() {
         preview_all();
         return;
     }
-    if args.len() >= 3 {
-        match args[1].as_str() {
-            "--refresh-other" => {
-                refresh::run_refresh_other(&args[2]);
-                return;
-            }
-            "--refresh-stack" => {
-                refresh::run_refresh_stack(&args[2]);
-                return;
-            }
-            _ => {}
-        }
+    if args.len() >= 3 && args[1] == "--refresh-stack" {
+        refresh::run_refresh_stack(&args[2]);
+        return;
     }
     render_once();
 }
@@ -153,7 +144,6 @@ fn render_once() {
 
     // Spawn async refreshes for stale caches BEFORE rendering, so by the next
     // tick the freshest data is in place.
-    refresh::maybe_spawn_other(&session.session_id, &session.transcript, &handle.state);
     refresh::maybe_spawn_stack(&session.session_id, &session.cwd, &handle.state);
     recent_prs::maybe_spawn_refresh();
 
@@ -161,8 +151,8 @@ fn render_once() {
     let _focused = focus::detect(&session, &mut handle.state);
     let git = git::view(&session, &handle.state);
     handle.state.watch = git.watch.clone();
-    let other = transcript::other_prs_view(&handle.state, &git.origin_url);
     let (burn, agents) = transcript::scan(&session, &mut handle.state);
+    let other = transcript::other_prs_view(&handle.state, &git.origin_url);
 
     let line = render::build_with_state(
         &session,

@@ -235,6 +235,16 @@ fn fetch_branch_prs(watches: &[crate::state::Watch]) -> HashMap<String, String> 
     out
 }
 
+/// Mark the cache stale and refresh now, so a PR first mentioned this render
+/// gets its state color without waiting out `recent_prs_ttl`.
+pub fn invalidate() {
+    let mut cur = RecentPrs::load();
+    cur.fetched_at = 0;
+    cur.locked_at = 0;
+    let _ = cur.save();
+    maybe_spawn_refresh();
+}
+
 /// Spawn a detached refresh worker if the cache is stale and not currently
 /// locked. Returns immediately — the worker runs in background.
 pub fn maybe_spawn_refresh() {

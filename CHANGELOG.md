@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Renders no longer reparse the whole transcript. Burn, agent and PR-chip
+  totals resume from a stored byte offset and parse only the lines appended
+  since the last render. A background `--refresh-other` rescan used to start
+  on every render, because its debounce could never pass.
+
 - PR chips no longer go dim when their PR falls outside the recent-100
   window. Each refresh used to discard last cycle's by-URL lookups and
   refill only 40 of the gaps; it now keeps last-known state and fetches
@@ -19,6 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session that prompted this, 1 relevant PR against 49 URLs that only
   ever appeared inside tool output. System-reminder blocks are stripped
   too, so example URLs injected from CLAUDE.md no longer become chips.
+
+### Removed
+
+- The `--refresh-other` subcommand and the `other_cache_ttl` config key. PR
+  chips are now collected during the render's own transcript pass.
 
 ### Added
 
