@@ -12,6 +12,7 @@
 use crate::cache::now_epoch;
 use crate::config;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -86,17 +87,15 @@ pub struct PrCache {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OtherPrCache {
-    pub fetched_at: i64,
-    pub locked_at: i64,
+    /// Every PR URL mentioned in chat text, first appearance first. Kept across
+    /// a transcript rewrite, so `/compact` never drops a chip.
     pub urls: Vec<String>,
     /// Last PR URL mentioned in chat text — the one the conversation is on.
     pub latest: String,
-    /// Transcript bytes already scanned for URLs; only what follows is read.
-    pub offset: u64,
 }
 
 /// Graphite stack snapshot for the current worktree. Populated asynchronously
-/// by `--refresh-other` (runs `gt log --json` in $CWD) and consumed by the
+/// by `--refresh-stack` (runs `gt log --json` in $CWD) and consumed by the
 /// chips component to render PRs in trunk→leaf order with stack separators.
 ///
 /// `is_gt` is `true` only when `gt` is on $PATH AND `gt log --json` parsed
@@ -132,7 +131,7 @@ pub struct TranscriptScan {
     pub tokens: u64,
     pub agents_total: u32,
     /// Agent tool_use ids with no tool_result yet.
-    pub open_agents: Vec<String>,
+    pub open_agents: BTreeSet<String>,
 }
 
 /// RAII handle holding an exclusive OS lock on the per-session state file.
