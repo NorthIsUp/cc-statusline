@@ -4,12 +4,12 @@
 // transcript scans (burn, agents) run inline since they only touch a local
 // file and use mtime-keyed caching.
 
-use crate::cache::mtime;
 use crate::input::Session;
-use crate::state::State;
+use crate::state::{State, TranscriptScan};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::OnceLock;
 
 /// Every PR URL Claude *wrote about* in the transcript at `path`, with
@@ -31,10 +31,10 @@ use std::sync::OnceLock;
 /// Returns the URLs in first-appearance order plus the *last* one mentioned
 /// anywhere in the file — the PR the conversation is currently on, which the
 /// chips component renders bold.
-pub fn pr_urls_in_transcript(path: &str) -> (Vec<String>, Option<String>) {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(_) => return (Vec::new(), None),
+pub fn pr_urls_in_transcript(path: &str, offset: u64) -> (Vec<String>, Option<String>, u64) {
+    let (text, _, end) = match read_tail(path, offset) {
+        Some(t) => t,
+        None => return (Vec::new(), None, offset),
     };
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -47,7 +47,30 @@ pub fn pr_urls_in_transcript(path: &str) -> (Vec<String>, Option<String>) {
             }
         }
     }
-    (out, latest)
+    (out, latest, end)
+}
+
+/// The complete lines appended to `path` since byte `offset`, plus where they
+/// start and end. A file shorter than `offset` was rewritten, so it is read
+/// from 0 and `start != offset` tells the caller to drop its totals. A partial
+/// last line is left for the next call.
+///
+/// shortcut: a rewrite that leaves the file longer than `offset` reads as an
+/// append. Claude Code only appends today; store a hash of the first line to
+/// catch rewrites if that changes.
+fn read_tail(path: &str, offset: u64) -> Option<(String, u64, u64)> {
+    let mut f = File::open(path).ok()?;
+    let start = if f.metadata().ok()?.len() < offset {
+        0
+    } else {
+        offset
+    };
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    let len = buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    buf.truncate(len);
+    Some((String::from_utf8(buf).ok()?, start, start + len as u64))
 }
 
 /// The parts of one transcript JSONL line a PR URL may be harvested from:
@@ -240,41 +263,33 @@ pub struct BurnInfo {
     pub tokens_total: u64,
 }
 
-/// Token burn and the subagent counter in one pass over the transcript.
-///
-/// Both metrics used to walk the file independently, so a render whose mtime
-/// had moved read and JSON-parsed the whole thing twice — ~80ms of foreground
-/// CPU on a 37MB transcript, every turn.
-///
-/// ponytail: still O(file) per change. The transcript is append-only JSONL, so
-/// the upgrade is to cache a byte offset alongside the mtime and parse only the
-/// tail, full-rescanning when the file shrinks (`/compact` rewrites it).
+/// Burn and agent totals, advanced by parsing only the transcript lines added
+/// since the last render. Reparsing the whole file on every change cost ~80ms
+/// of foreground CPU per turn on a 37MB transcript, times every session.
 pub fn scan(session: &Session, st: &mut State) -> (BurnInfo, AgentCount) {
     let mut burn = BurnInfo::default();
     let mut agents = AgentCount::default();
-    if session.transcript.is_empty() || !Path::new(&session.transcript).exists() {
+    if session.transcript.is_empty() {
         return (burn, agents);
     }
 
-    let tm = mtime(Path::new(&session.transcript)).unwrap_or(0);
-    if st.burn.transcript_mtime != tm || st.agents.transcript_mtime != tm {
-        let s = scan_file(&session.transcript);
-        st.burn.transcript_mtime = tm;
-        st.burn.total_tokens = s.tokens;
-        st.agents.transcript_mtime = tm;
-        st.agents.active = s.agents_active;
-        st.agents.total = s.agents_total;
+    if let Some((text, start, end)) = read_tail(&session.transcript, st.transcript.offset) {
+        if start != st.transcript.offset {
+            st.transcript = TranscriptScan::default();
+        }
+        accumulate(&mut st.transcript, &text);
+        st.transcript.offset = end;
     }
 
-    agents.active = st.agents.active;
-    agents.total = st.agents.total;
+    agents.active = st.transcript.open_agents.len() as u32;
+    agents.total = st.transcript.agents_total;
 
     // Burn needs a minute of wall time before a rate means anything.
-    if session.duration_ms > 60_000 && st.burn.total_tokens > 0 {
-        burn.tokens_total = st.burn.total_tokens;
+    if session.duration_ms > 60_000 && st.transcript.tokens > 0 {
+        burn.tokens_total = st.transcript.tokens;
         burn.tokens_per_hour = st
-            .burn
-            .total_tokens
+            .transcript
+            .tokens
             .saturating_mul(3_600_000)
             .checked_div(session.duration_ms.max(1) as u64)
             .unwrap_or(0);
@@ -282,21 +297,10 @@ pub fn scan(session: &Session, st: &mut State) -> (BurnInfo, AgentCount) {
     (burn, agents)
 }
 
-#[derive(Debug, Default, PartialEq)]
-struct ScanStats {
-    tokens: u64,
-    agents_active: u32,
-    agents_total: u32,
-}
-
-/// One read, one JSON parse per line, both metrics accumulated together.
-fn scan_file(path: &str) -> ScanStats {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(_) => return ScanStats::default(),
-    };
-    let mut out = ScanStats::default();
-    let mut open: HashSet<String> = HashSet::new();
+/// Fold JSONL `text` into the running totals: one JSON parse per line, both
+/// metrics from the same pass.
+fn accumulate(scan: &mut TranscriptScan, text: &str) {
+    let mut open: HashSet<String> = scan.open_agents.drain(..).collect();
     for line in text.lines() {
         let v: Value = match serde_json::from_str(line) {
             Ok(v) => v,
@@ -308,7 +312,7 @@ fn scan_file(path: &str) -> ScanStats {
         };
         if let Some(usage) = msg.get("usage").and_then(|u| u.as_object()) {
             let pick = |k| usage.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
-            out.tokens += pick("input_tokens")
+            scan.tokens += pick("input_tokens")
                 + pick("output_tokens")
                 + pick("cache_creation_input_tokens")
                 + pick("cache_read_input_tokens");
@@ -323,7 +327,7 @@ fn scan_file(path: &str) -> ScanStats {
                     if item.get("name").and_then(|x| x.as_str()) == Some("Agent") {
                         if let Some(id) = item.get("id").and_then(|x| x.as_str()) {
                             open.insert(id.to_string());
-                            out.agents_total += 1;
+                            scan.agents_total += 1;
                         }
                     }
                 }
@@ -336,8 +340,8 @@ fn scan_file(path: &str) -> ScanStats {
             }
         }
     }
-    out.agents_active = open.len() as u32;
-    out
+    scan.open_agents = open.into_iter().collect();
+    scan.open_agents.sort();
 }
 
 #[derive(Debug, Default)]
@@ -381,9 +385,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cc-prurl-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("t.jsonl");
-        std::fs::write(&p, lines.join("\n")).unwrap();
+        std::fs::write(&p, lines.join("\n") + "\n").unwrap();
         assert_eq!(
-            pr_urls_in_transcript(p.to_str().unwrap()).0,
+            pr_urls_in_transcript(p.to_str().unwrap(), 0).0,
             vec![
                 "https://github.com/o/r/pull/1".to_string(),
                 "https://github.com/o/r/pull/2".to_string(),
@@ -430,8 +434,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cc-latest-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("t.jsonl");
-        std::fs::write(&p, lines.join("\n")).unwrap();
-        let (urls, latest) = pr_urls_in_transcript(p.to_str().unwrap());
+        std::fs::write(&p, lines.join("\n") + "\n").unwrap();
+        let (urls, latest, _) = pr_urls_in_transcript(p.to_str().unwrap(), 0);
         assert_eq!(urls.len(), 2);
         assert_eq!(latest.unwrap(), "https://github.com/o/r/pull/2");
         let _ = std::fs::remove_dir_all(&dir);
@@ -442,56 +446,109 @@ mod tests {
         assert!(scan_pr_urls("no links here").is_empty());
     }
 
+    fn scanned(text: &str) -> TranscriptScan {
+        let mut scan = TranscriptScan::default();
+        accumulate(&mut scan, text);
+        scan
+    }
+
     /// The merged pass must still total usage across every shape of line and
     /// leave the agent counter agreeing with the tool_use/tool_result pairing:
     /// two Agents dispatched, one returned, so one stays open.
     #[test]
-    fn scan_file_totals_tokens_and_pairs_agents() {
-        let lines = [
-            r#"{"message":{"usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":1,"cache_read_input_tokens":2}}}"#,
-            r#"{"message":{"content":[{"type":"tool_use","name":"Agent","id":"a1"},{"type":"tool_use","name":"Bash","id":"b1"}]}}"#,
-            r#"{"message":{"content":[{"type":"tool_use","name":"Agent","id":"a2"}],"usage":{"input_tokens":7}}}"#,
-            r#"{"message":{"content":[{"type":"tool_result","tool_use_id":"a1"}]}}"#,
-            "not json at all",
-            r#"{"no_message":true}"#,
-        ];
-        let dir = std::env::temp_dir().join(format!("cc-scan-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("t.jsonl");
-        std::fs::write(&p, lines.join("\n")).unwrap();
-
-        let got = scan_file(p.to_str().unwrap());
-        assert_eq!(
-            got,
-            ScanStats {
-                tokens: 25,       // 10+5+1+2 then +7
-                agents_active: 1, // a2 still open, a1 returned
-                agents_total: 2,  // Bash is not an Agent
-            }
+    fn accumulate_totals_tokens_and_pairs_agents() {
+        let got = scanned(
+            &[
+                r#"{"message":{"usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":1,"cache_read_input_tokens":2}}}"#,
+                r#"{"message":{"content":[{"type":"tool_use","name":"Agent","id":"a1"},{"type":"tool_use","name":"Bash","id":"b1"}]}}"#,
+                r#"{"message":{"content":[{"type":"tool_use","name":"Agent","id":"a2"}],"usage":{"input_tokens":7}}}"#,
+                r#"{"message":{"content":[{"type":"tool_result","tool_use_id":"a1"}]}}"#,
+                "not json at all",
+                r#"{"no_message":true}"#,
+            ]
+            .join("\n"),
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got.tokens, 25); // 10+5+1+2 then +7
+        assert_eq!(got.open_agents, vec!["a2".to_string()]); // a1 returned
+        assert_eq!(got.agents_total, 2); // Bash is not an Agent
     }
 
     /// A line carrying both usage and content must be counted by both halves —
     /// the failure mode of merging two loops into one is an early `continue`
     /// that skips the other metric.
     #[test]
-    fn scan_file_counts_both_metrics_on_one_line() {
-        let dir = std::env::temp_dir().join(format!("cc-scan2-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("t.jsonl");
-        std::fs::write(
-            &p,
+    fn accumulate_counts_both_metrics_on_one_line() {
+        let got = scanned(
             r#"{"message":{"usage":{"input_tokens":3},"content":[{"type":"tool_use","name":"Agent","id":"x"}]}}"#,
-        )
-        .unwrap();
-
-        let got = scan_file(p.to_str().unwrap());
+        );
         assert_eq!(got.tokens, 3, "usage on an Agent line must still count");
         assert_eq!(
             got.agents_total, 1,
             "Agent on a usage line must still count"
         );
+    }
+
+    /// Renders between appends must land on the same totals as one full pass:
+    /// an Agent opened in one chunk and returned in the next closes, a partial
+    /// last line waits for its newline, and a file that shrank (rewritten) is
+    /// recounted from scratch rather than added on top.
+    #[test]
+    fn scan_tail_matches_a_full_pass_and_restarts_on_rewrite() {
+        let dir = std::env::temp_dir().join(format!("cc-tail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.jsonl");
+        let session = Session {
+            transcript: p.to_str().unwrap().into(),
+            ..Default::default()
+        };
+        let open = r#"{"message":{"usage":{"input_tokens":4},"content":[{"type":"tool_use","name":"Agent","id":"a"}]}}"#;
+        let close = r#"{"message":{"usage":{"input_tokens":6},"content":[{"type":"tool_result","tool_use_id":"a"}]}}"#;
+        let mut st = State::default();
+
+        std::fs::write(&p, format!("{open}\n{}", &close[..10])).unwrap();
+        scan(&session, &mut st);
+        assert_eq!(
+            (st.transcript.tokens, st.transcript.open_agents.len()),
+            (4, 1)
+        );
+
+        std::fs::write(&p, format!("{open}\n{close}\n")).unwrap();
+        scan(&session, &mut st);
+        let full = TranscriptScan {
+            offset: std::fs::metadata(&p).unwrap().len(),
+            ..scanned(&format!("{open}\n{close}\n"))
+        };
+        assert_eq!(st.transcript, full);
+        assert_eq!(
+            (st.transcript.tokens, st.transcript.open_agents.len()),
+            (10, 0)
+        );
+
+        std::fs::write(&p, format!("{close}\n")).unwrap();
+        scan(&session, &mut st);
+        assert_eq!((st.transcript.tokens, st.transcript.agents_total), (6, 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The URL scan resumes where it stopped: a second call sees only the new
+    /// mention, and its offset covers the whole file.
+    #[test]
+    fn pr_urls_resume_from_offset() {
+        let dir = std::env::temp_dir().join(format!("cc-prtail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.jsonl");
+        let say = |n: u32| {
+            format!(
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"https://github.com/o/r/pull/{n}"}}]}}}}"#
+            )
+        };
+        std::fs::write(&p, say(1) + "\n").unwrap();
+        let (_, _, off) = pr_urls_in_transcript(p.to_str().unwrap(), 0);
+        std::fs::write(&p, say(1) + "\n" + &say(2) + "\n").unwrap();
+        let (urls, latest, end) = pr_urls_in_transcript(p.to_str().unwrap(), off);
+        assert_eq!(urls, vec!["https://github.com/o/r/pull/2".to_string()]);
+        assert_eq!(latest.unwrap(), "https://github.com/o/r/pull/2");
+        assert_eq!(end, std::fs::metadata(&p).unwrap().len());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

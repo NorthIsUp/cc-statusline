@@ -15,9 +15,6 @@ nerd_font_width = 1
 # Seconds. How long the current-branch PR cache is fresh.
 pr_cache_ttl = 10
 
-# Seconds. How long the "other PRs" cache + their states are fresh.
-other_cache_ttl = 120
-
 # Append focus diagnostics to /tmp/cc-focus-<session_id>.log every render.
 # Off by default — the file is never rotated and grows ~1 line/second.
 debug_focus_log = false
