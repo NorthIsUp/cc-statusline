@@ -81,18 +81,13 @@ pub fn maybe_spawn_pr(session_id: &str, cwd: &str, st: &state::State) {
 }
 
 pub fn maybe_spawn_other(session_id: &str, transcript: &str, st: &state::State) {
-    if transcript.is_empty() {
-        return;
-    }
-    let ttl = config::config().other_cache_ttl();
-    if state::fresh(st.other_prs.fetched_at, ttl)
-        && state::fresh(st.other_prs.locked_at, ttl)
-        && !st.other_prs.urls.is_empty()
-        && !st.other_prs.states_json.is_empty()
-    {
-        return;
-    }
-    if state::fresh(st.other_prs.locked_at, ttl.max(30)) {
+    // Only when the transcript grew (or shrank, on a rewrite) past what the
+    // last scan covered: an idle session costs one stat per render.
+    let len = match std::fs::metadata(transcript) {
+        Ok(m) => m.len(),
+        Err(_) => return,
+    };
+    if len == st.other_prs.offset || state::fresh(st.other_prs.locked_at, 30) {
         return;
     }
     spawn_self(
@@ -243,23 +238,22 @@ pub fn run_refresh_pr(session_id: &str) {
 
 pub fn run_refresh_other(session_id: &str) {
     let transcript = std::env::var(ENV_TRANSCRIPT).unwrap_or_default();
-    {
-        // Stamp the debounce, then release before the scan — the transcript
-        // runs to tens of MB and a foreground render waits on this lock.
+    let offset = {
+        // Stamp the debounce, then release before the scan — a foreground
+        // render waits on this lock.
         let mut handle = match StateLock::acquire_blocking(session_id) {
             Ok(h) => h,
             Err(_) => return,
         };
         handle.state.other_prs.locked_at = now_epoch();
         let _ = handle.save();
-    }
+        handle.state.other_prs.offset
+    };
 
-    // All PR URLs referenced in the transcript (created + linked), scanned
-    // in-process — the equivalent of `cc-thread-prs --urls-only --all`. This
-    // captures PRs created out-of-band (e.g. via Graphite `gt`) and ones the
-    // conversation merely touched. The chips component collapses a large set
-    // to a `×N` summary.
-    let (new_urls, latest) = crate::transcript::pr_urls_in_transcript(&transcript);
+    // PR URLs in the lines appended since the last scan. Claude Code appends
+    // to the transcript, so the URL list is a running union; a shorter file
+    // (rewritten) is rescanned from the start, and the union keeps old chips.
+    let (new_urls, latest, offset) = crate::transcript::pr_urls_in_transcript(&transcript, offset);
 
     let mut handle = match StateLock::acquire_blocking(session_id) {
         Ok(h) => h,
@@ -285,6 +279,7 @@ pub fn run_refresh_other(session_id: &str) {
     if let Some(l) = latest {
         handle.state.other_prs.latest = l;
     }
+    handle.state.other_prs.offset = offset;
     handle.state.other_prs.fetched_at = now_epoch();
 
     if has_new {

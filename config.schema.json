@@ -146,14 +146,6 @@
       "format": "uint32",
       "minimum": 0.0
     },
-    "other_cache_ttl": {
-      "default": null,
-      "type": [
-        "integer",
-        "null"
-      ],
-      "format": "int64"
-    },
     "pr_cache_ttl": {
       "default": null,
       "type": [

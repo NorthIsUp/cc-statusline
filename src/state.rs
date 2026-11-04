@@ -30,8 +30,7 @@ pub struct State {
     pub pr: PrCache,
     pub other_prs: OtherPrCache,
     pub stack: StackCache,
-    pub burn: BurnCache,
-    pub agents: AgentCache,
+    pub transcript: TranscriptScan,
     /// Monotonic render counter. Drives the spinner so it advances exactly one
     /// frame per render, immune to harness invocation gaps and intra-second
     /// re-renders that would skip / repeat frames if we used epoch seconds.
@@ -92,8 +91,8 @@ pub struct OtherPrCache {
     pub urls: Vec<String>,
     /// Last PR URL mentioned in chat text — the one the conversation is on.
     pub latest: String,
-    /// Raw JSON object: {url -> {state, isDraft}}.
-    pub states_json: String,
+    /// Transcript bytes already scanned for URLs; only what follows is read.
+    pub offset: u64,
 }
 
 /// Graphite stack snapshot for the current worktree. Populated asynchronously
@@ -124,19 +123,16 @@ pub struct StackEntry {
     pub depth: u32,
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+/// Running totals over the transcript up to `offset`. The transcript is
+/// append-only JSONL, so each render parses only the lines added since.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct BurnCache {
-    pub transcript_mtime: i64,
-    pub total_tokens: u64,
-}
-
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AgentCache {
-    pub transcript_mtime: i64,
-    pub active: u32,
-    pub total: u32,
+pub struct TranscriptScan {
+    pub offset: u64,
+    pub tokens: u64,
+    pub agents_total: u32,
+    /// Agent tool_use ids with no tool_result yet.
+    pub open_agents: Vec<String>,
 }
 
 /// RAII handle holding an exclusive OS lock on the per-session state file.

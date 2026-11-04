@@ -63,7 +63,6 @@ pub struct Config {
     pub nerd_font_width: Option<u32>,
     pub pr_expand_min_cols: Option<u32>,
     pub pr_cache_ttl: Option<i64>,
-    pub other_cache_ttl: Option<i64>,
     pub debug_focus_log: Option<bool>,
     pub spinner: Option<String>,
     pub recent_prs_ttl: Option<i64>,
@@ -147,9 +146,6 @@ impl Config {
     }
     pub fn pr_cache_ttl(&self) -> i64 {
         self.pr_cache_ttl.unwrap_or(60)
-    }
-    pub fn other_cache_ttl(&self) -> i64 {
-        self.other_cache_ttl.unwrap_or(600)
     }
     pub fn stack_refresh_ttl(&self) -> i64 {
         self.chips.stack_refresh_ttl
